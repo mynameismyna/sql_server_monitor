@@ -1,0 +1,6 @@
+PyQt5==5.15.10
+pyodbc==5.0.1
+pandas==2.1.4
+openpyxl==3.1.2
+pyinstaller==6.3.0
+
