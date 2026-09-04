@@ -1244,20 +1244,6 @@ PREDEFINED_QUERIES = {
     
     "VLF (Virtual Log File) Sayısı": """
         -- Yüksek VLF sayısı performans sorunlarına yol açabilir
-        CREATE TABLE #VLFInfo (
-            RecoveryUnitId INT,
-            FileId INT,
-            FileSize BIGINT,
-            StartOffset BIGINT,
-            FSeqNo BIGINT,
-            Status BIGINT,
-            Parity BIGINT,
-            CreateLSN NUMERIC(38)
-        );
-        
-        INSERT INTO #VLFInfo
-        EXEC sp_executesql N'DBCC LOGINFO WITH NO_INFOMSGS';
-        
         SELECT 
             DB_NAME() AS database_name,
             COUNT(*) AS vlf_count,
@@ -1267,10 +1253,8 @@ PREDEFINED_QUERIES = {
                 WHEN COUNT(*) > 100 THEN 'Orta - İzleme Gerekli'
                 ELSE 'Normal'
             END AS status,
-            CAST(SUM(FileSize) / 1024.0 / 1024.0 AS DECIMAL(10, 2)) AS total_log_size_mb
-        FROM #VLFInfo;
-        
-        DROP TABLE #VLFInfo;
+            CAST(SUM(vlf_size_mb) AS DECIMAL(10, 2)) AS total_log_size_mb
+        FROM sys.dm_db_log_info(DB_ID())
     """,
     
     "Columnstore Index Analizleri": """

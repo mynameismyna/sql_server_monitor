@@ -1,11 +1,11 @@
 # SQL Sunucu Takip Uygulaması
 
-SQL Server üzerinde analizler yapmak, hataları takip etmek ve özel sorgular çalıştırmak için geliştirilmiş basit masaüstü uygulaması.
+SQL Server üzerinde analiz yapmak, hataları takip etmek ve read-only sorgular çalıştırmak için geliştirilmiş masaüstü uygulaması.
 
 ## Özellikler
 
 - **SQL Server Bağlantı Yönetimi**: Windows Authentication ve SQL Server Authentication desteği
-- **Özel SQL Sorguları**: Kendi yazdığınız SQL sorgularını çalıştırma
+- **Read-only SQL Sorguları**: Kendi yazdığınız `SELECT` ve CTE sorgularını güvenli varsayılanlarla çalıştırma
 - **Hazır Analiz Sorguları**: 
   - Aktif bağlantılar
   - Yavaş çalışan sorgular
@@ -18,18 +18,20 @@ SQL Server üzerinde analizler yapmak, hataları takip etmek ve özel sorgular �
   - Tablo satır sayıları
 - **Sorgu Sonuçları**: Sonuçları tablo formatında görüntüleme
 - **Hata Yönetimi**: Detaylı hata mesajlarını görüntüleme
+- **Sonuç Sınırı**: Büyük sonuç kümelerini ilk 10.000 satırla sınırlandırma
+- **Eşzamanlı Çalışma Koruması**: Önceki sorgu tamamlanmadan yeni sorgu başlatmama
 
 ## Kurulum
 
 ### Gereksinimler
-- Python 3.8 veya üzeri
+- Python 3.9 veya üzeri
 - SQL Server ODBC Driver 17 (veya üzeri)
 
 ### Adımlar
 
 1. Gerekli Python paketlerini yükleyin:
 ```bash
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 2. SQL Server ODBC Driver'ı yükleyin (eğer yüklü değilse):
@@ -46,17 +48,29 @@ python main.py
 
 Uygulama açıldığında:
 
-1. **Sunucu**: SQL Server adresini girin (örn: `localhost`, `192.168.1.100` veya `SERVERNAME\INSTANCENAME`)
-2. **Veritabanı**: Bağlanmak istediğiniz veritabanı adını girin (varsayılan: `master`)
-3. **Kimlik Doğrulama**: 
+1. **Sunucu**: SQL Server adresini girin (örn: `localhost` veya `SERVERNAME\INSTANCENAME`)
+2. **Kimlik Doğrulama**:
    - **Windows**: Windows kimlik bilgilerinizle otomatik giriş
    - **SQL Server**: SQL Server kullanıcı adı ve şifresi gerektirir
-4. **Bağlan** butonuna tıklayın
+3. **Bağlan** butonuna tıklayın
+4. Bağlantı kurulduktan sonra aktif veritabanını listeden seçin
+
+### Güvenlik
+
+- SQL Server Authentication parolası diske kaydedilmez ve her uygulama oturumunda yeniden girilmelidir.
+- Bağlantı `Encrypt=yes` ve `TrustServerCertificate=no` ile kurulur; SQL Server sertifikasının istemci tarafından güvenilir olması gerekir.
+- Kalıcı veri veya şema değiştiren T-SQL komutları engellenir. Uygulama tek seferde yalnızca bir read-only `SELECT` veya CTE sorgusu çalıştırır.
+- Her sorgu sonunda transaction geri alınır ve hata durumunda rollback uygulanır.
+- `connection_config.json` yalnızca sunucu, veritabanı, kimlik doğrulama türü ve kullanıcı adı gibi hassas olmayan bağlantı tercihlerini içerir.
+- Uygulamaya ve SQL Server hesabına yalnızca gerekli en düşük yetkileri verin; hazır sorguların izin gereksinimlerini `QUERY_COMPATIBILITY.md` üzerinden kontrol edin.
+- Uygulama katmanındaki sorgu kontrolü tek başına bir yetkilendirme sınırı değildir; kalıcı koruma SQL Server hesabının read-only ve en düşük yetkili olmasıyla sağlanmalıdır.
+- Yapılandırma, sorgu veya dağıtım dosyalarını paylaşmadan önce kurumunuza ait sunucu adlarını, kullanıcı adlarını ve özel sorguları gözden geçirin.
 
 ## Kullanım İpuçları
 
 - **F5 Tuşu**: Sorguyu hızlıca çalıştırmak için F5 tuşunu kullanabilirsiniz
 - **Hazır Sorgular**: Dropdown menüden hazır analiz sorgularını seçebilirsiniz
+- **Otomatik Çalıştırma**: Yalnızca read-only sorgular otomatik çalıştırılabilir; önceki sorgu bitmeden yenisi başlamaz
 - **Sonuçlar**: Sorgu sonuçları otomatik olarak tablo formatında gösterilir
 - **Hatalar**: Herhangi bir hata durumunda detaylı mesajlar "Hata Mesajları" bölümünde görüntülenir
 
@@ -70,8 +84,9 @@ Uygulama açıldığında:
 
 - Windows Authentication için SQL Server'ın Windows kimlik doğrulamasını desteklemesi gerekir
 - SQL Server Authentication için geçerli bir kullanıcı adı ve şifre gereklidir
-- Uygulama, SQL Server'ın varsayılan portu olan 1433'ü kullanır (farklı port için sunucu adına `:port` ekleyin, örn: `localhost:1434`)
+- Uygulama, SQL Server'ın varsayılan portu olan 1433'ü kullanır (farklı TCP portu için sunucu adına virgülle port ekleyin, örn: `localhost,1434`)
 - Uzun süren sorgular UI'ı dondurmaz (thread kullanımı sayesinde)
+- İlk 10.000 sonuç satırı gösterilir; daha büyük sonuçlar sorguda filtrelenmelidir
 
 ## Sorgu Uyumluluğu
 
@@ -81,6 +96,7 @@ Uygulama açıldığında:
 - **Özel izinler** gerektirebilir (VIEW SERVER STATE, sysadmin)
 - **Belirli özelliklerin yüklü olmasını** gerektirebilir (Replication, SQL Agent)
 - **System database'lere erişim** gerektirebilir (msdb, distribution)
+- **VLF sorgusu için SQL Server 2016 SP2 veya üzeri** gerektirir
 
 Detaylı uyumluluk bilgileri için `QUERY_COMPATIBILITY.md` dosyasına bakın.
 

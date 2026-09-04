@@ -2,7 +2,7 @@
 
 ## Gereksinimler
 
-1. Python 3.8 veya üzeri
+1. Python 3.9 veya üzeri
 2. Tüm bağımlılıkların yüklü olması
 3. PyInstaller paketi
 
@@ -17,7 +17,7 @@ build_exe.bat
 ```
 
 Bu script:
-- PyInstaller'ı otomatik yükler (yoksa)
+- Gerekli bağımlılıkların yüklü olduğunu kontrol eder
 - EXE dosyasını oluşturur
 - Sonuç dosyasını `dist` klasörüne koyar
 
@@ -25,18 +25,18 @@ Bu script:
 
 1. PyInstaller'ı yükleyin:
 ```bash
-pip install pyinstaller
+python -m pip install -r requirements.txt
 ```
 
 2. EXE oluşturun:
 ```bash
-pyinstaller build_exe.spec
+python -m PyInstaller build_exe.spec
 ```
 
 VEYA
 
 ```bash
-pyinstaller --name="SQL_Sunucu_Takip" --onefile --windowed --add-data="QUERY_COMPATIBILITY.md;." main.py
+python -m PyInstaller --name="SQL_Sunucu_Takip" --onefile --windowed --add-data="QUERY_COMPATIBILITY.md;." main.py
 ```
 
 ## Çıktı Dosyaları
@@ -59,13 +59,13 @@ pyinstaller --name="SQL_Sunucu_Takip" --onefile --windowed --add-data="QUERY_COM
 ### Çalıştırma
 1. `dist\SQL_Sunucu_Takip.exe` dosyasını çalıştırın
 2. İlk çalıştırmada bağlantı ayarlarını girin
-3. Ayarlar `connection_config.json` dosyasına kaydedilir
+3. Hassas olmayan bağlantı tercihleri `connection_config.json` dosyasına kaydedilir
+4. SQL Server Authentication parolası kaydedilmez ve her oturumda yeniden girilir
 
 ### Dağıtım
 EXE dosyasını başka bilgisayarlara kopyalayabilirsiniz. Gereksinimler:
 - Windows işletim sistemi
 - SQL Server ODBC Driver 17
-- .NET Framework (Windows'ta genelde yüklü)
 
 ## Sorun Giderme
 
@@ -74,8 +74,9 @@ EXE dosyasını başka bilgisayarlara kopyalayabilirsiniz. Gereksinimler:
   https://docs.microsoft.com/en-us/sql/connect/odbc/download-odbc-driver-for-sql-server
 
 ### "Failed to execute script" hatası
-- Antivirus programını geçici olarak devre dışı bırakın
-- Windows Defender'dan exe'yi hariç tutun
+- Antivirüs korumasını devre dışı bırakmayın ve geniş kapsamlı istisna oluşturmayın
+- EXE'yi güvenilir kaynak koddan yerel olarak yeniden derleyin ve dosya bütünlüğünü doğrulayın
+- Kurumsal güvenlik ekibinizle uyarı ayrıntılarını ve dosya hash'ini paylaşarak false-positive incelemesi isteyin
 
 ### Dosya boyutu büyük
 - Normal: 150-250 MB (tüm bağımlılıklar dahil)
@@ -98,6 +99,6 @@ EXE dosyasını başka bilgisayarlara kopyalayabilirsiniz. Gereksinimler:
 ## Notlar
 
 - EXE dosyası ilk çalıştırmada biraz yavaş açılabilir (normal)
-- Ayar dosyaları (connection_config.json, user_queries.json) EXE ile aynı klasörde oluşturulur
-- Antivirüs programları bazen false-positive uyarı verebilir (normal)
+- Ayar dosyaları (`connection_config.json`, `user_queries.json`) EXE ile aynı klasörde oluşturulur; parola kaydedilmez
+- Antivirüs uyarısı oluşursa dosya hash'i ve kaynak kod incelenmeden istisna oluşturulmamalıdır
 

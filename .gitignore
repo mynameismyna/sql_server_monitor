@@ -37,10 +37,12 @@ Thumbs.db
 # App specific
 connection_config.json
 user_queries.json
+dist.rar
 
 # PyInstaller
 build/
 dist/
 *.spec
+!build_exe.spec
 __pycache__/
 

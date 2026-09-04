@@ -12,14 +12,15 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QIntValidator
 import pandas as pd
 from datetime import datetime
-from sql_connection import SQLConnection
+from sql_connection import QueryResult, SQLConnection
+from query_safety import validate_read_only_query
 from predefined_queries import PREDEFINED_QUERIES, get_all_queries, save_user_query, delete_user_query, load_user_queries, rename_user_query, get_user_query_categories
 from config_manager import ConfigManager
 
 
 class QueryThread(QThread):
     """Sorgu çalıştırma için thread sınıfı (UI donmasını önlemek için)"""
-    finished = pyqtSignal(bool, object, str)
+    query_completed = pyqtSignal(bool, object, str)
     
     def __init__(self, sql_conn, query):
         super().__init__()
@@ -28,7 +29,7 @@ class QueryThread(QThread):
     
     def run(self):
         success, result, error = self.sql_conn.execute_query(self.query)
-        self.finished.emit(success, result, error)
+        self.query_completed.emit(success, result, error or "")
 
 
 class SQLServerApp(QMainWindow):
@@ -40,6 +41,7 @@ class SQLServerApp(QMainWindow):
         self.current_results_columns = None
         self.current_results_rows = None
         self.full_texts = {}
+        self.query_thread = None
         self.auto_timer = QTimer()
         self.auto_timer.timeout.connect(self.auto_execute_query)
         self.auto_duration_timer = QTimer()
@@ -339,7 +341,7 @@ class SQLServerApp(QMainWindow):
                 if index >= 0:
                     self.auth_combo.setCurrentIndex(index)
             self.username_input.setText(config.get("username", ""))
-            self.password_input.setText(config.get("password", ""))
+            self.password_input.clear()
     
     def on_database_selected(self, database):
         """Veritabanı seçildiğinde aktif veritabanını değiştir"""
@@ -805,8 +807,8 @@ class SQLServerApp(QMainWindow):
         )
         
         if success:
-            # Bağlantı ayarlarını kaydet (veritabanı olmadan)
-            ConfigManager.save_connection(server, "", auth_type, username, password)
+            ConfigManager.save_connection(server, "", auth_type, username)
+            self.password_input.clear()
             
             self.connection_status.setText("Bağlı ✓")
             self.connection_status.setStyleSheet("color: green; font-weight: bold;")
@@ -832,19 +834,31 @@ class SQLServerApp(QMainWindow):
     
     def execute_query(self):
         """SQL sorgusunu çalıştır"""
+        if self.query_thread and self.query_thread.isRunning():
+            self.statusBar().showMessage("Önceki sorgu hâlâ çalışıyor.")
+            return False
+
         query = self.query_editor.toPlainText().strip()
         
         if not query:
             QMessageBox.warning(self, "Uyarı", "Lütfen bir SQL sorgusu girin!")
-            return
+            return False
+
+        allowed, reason = validate_read_only_query(query)
+        if not allowed:
+            QMessageBox.warning(self, "Read-only Güvenlik", reason)
+            return False
         
         if not self.sql_conn.is_connected():
             QMessageBox.warning(self, "Uyarı", "Önce SQL Server'a bağlanmalısınız!")
-            return
+            return False
         
         # UI'ı güncelle
         self.execute_btn.setEnabled(False)
         self.export_excel_btn.setEnabled(False)
+        self.connect_btn.setEnabled(False)
+        self.database_combo.setEnabled(False)
+        self.predefined_combo.setEnabled(False)
         self.statusBar().showMessage("Sorgu çalıştırılıyor...")
         self.error_text.clear()
         self.results_table.setRowCount(0)
@@ -855,27 +869,42 @@ class SQLServerApp(QMainWindow):
         
         # Thread'de sorguyu çalıştır
         self.query_thread = QueryThread(self.sql_conn, query)
-        self.query_thread.finished.connect(self.on_query_finished)
+        self.query_thread.query_completed.connect(self.on_query_finished)
+        self.query_thread.finished.connect(self.on_query_thread_finished)
         self.query_thread.start()
+        return True
     
     def on_query_finished(self, success, result, error):
         """Sorgu tamamlandığında"""
         self.execute_btn.setEnabled(True)
+        self.connect_btn.setEnabled(True)
+        self.database_combo.setEnabled(True)
+        self.predefined_combo.setEnabled(True)
         
         if success:
-            if isinstance(result, tuple) and len(result) == 2:
-                # SELECT sorgusu sonucu
-                columns, rows = result
-                self.display_results(columns, rows)
-                self.statusBar().showMessage(f"Sorgu başarıyla tamamlandı. {len(rows)} satır döndü.")
+            if isinstance(result, QueryResult):
+                self.display_results(result.columns, result.rows)
+                if result.truncated:
+                    self.statusBar().showMessage(
+                        f"Sonuç ilk {len(result.rows)} satırla sınırlandırıldı."
+                    )
+                else:
+                    self.statusBar().showMessage(
+                        f"Sorgu başarıyla tamamlandı. {len(result.rows)} satır döndü."
+                    )
             else:
-                # INSERT, UPDATE, DELETE gibi sorgular
                 self.statusBar().showMessage(str(result))
-                QMessageBox.information(self, "Başarılı", str(result))
         else:
-            # Hata durumu
+            if self.auto_timer.isActive():
+                self.stop_auto_execution()
             self.error_text.setPlainText(error)
             self.statusBar().showMessage("Sorgu hatası!")
+
+    def on_query_thread_finished(self):
+        completed_thread = self.sender()
+        if self.query_thread is completed_thread:
+            self.query_thread = None
+        completed_thread.deleteLater()
         
     def start_auto_execution(self):
         """Otomatik sorgu çalıştırmayı başlat"""
@@ -906,17 +935,22 @@ class SQLServerApp(QMainWindow):
         if not query:
             QMessageBox.warning(self, "Uyarı", "Lütfen bir SQL sorgusu girin!")
             return
+
+        allowed, reason = validate_read_only_query(query)
+        if not allowed:
+            QMessageBox.warning(self, "Read-only Güvenlik", reason)
+            return
         
         if not self.sql_conn.is_connected():
             QMessageBox.warning(self, "Uyarı", "Önce SQL Server'a bağlanmalısınız!")
             return
         
-        # Timer'ları başlat
         self.auto_duration_seconds = duration
         self.auto_start_time = datetime.now()
         
-        # İlk sorguyu hemen çalıştır
-        self.execute_query()
+        if not self.execute_query():
+            self.auto_start_time = None
+            return
         
         # Interval timer'ı başlat (her X saniyede bir)
         self.auto_timer.start(interval * 1000)  # milisaniye cinsinden
@@ -946,6 +980,10 @@ class SQLServerApp(QMainWindow):
     
     def auto_execute_query(self):
         """Otomatik çalıştırma için sorguyu çalıştır"""
+        if self.query_thread and self.query_thread.isRunning():
+            self.statusBar().showMessage("Önceki otomatik sorgu tamamlanmayı bekliyor.")
+            return
+
         if not self.sql_conn.is_connected():
             self.stop_auto_execution()
             QMessageBox.warning(self, "Uyarı", "Bağlantı kesildi. Otomatik çalıştırma durduruldu.")
@@ -956,8 +994,13 @@ class SQLServerApp(QMainWindow):
             self.stop_auto_execution()
             QMessageBox.warning(self, "Uyarı", "Sorgu boş. Otomatik çalıştırma durduruldu.")
             return
+
+        allowed, reason = validate_read_only_query(query)
+        if not allowed:
+            self.stop_auto_execution()
+            QMessageBox.warning(self, "Read-only Güvenlik", reason)
+            return
         
-        # Sorguyu çalıştır (normal execute_query fonksiyonunu kullan)
         self.execute_query()
     
     def update_auto_status(self):
@@ -1209,7 +1252,7 @@ class SQLServerApp(QMainWindow):
         
         <h3>Teknolojiler:</h3>
         <ul>
-            <li>Python 3.8+</li>
+            <li>Python 3.9+</li>
             <li>PyQt5</li>
             <li>pyodbc</li>
             <li>pandas</li>
@@ -1263,7 +1306,7 @@ class SQLServerApp(QMainWindow):
             <div class="feature">
                 <h3>Bağlantı Ayarları</h3>
                 <ul>
-                    <li><b>Sunucu:</b> SQL Server adresi (örn: localhost, 192.168.1.100, SERVERNAME\\INSTANCE)</li>
+                    <li><b>Sunucu:</b> SQL Server adresi (örn: localhost, sql.example.local, SERVERNAME\\INSTANCE)</li>
                     <li><b>Veritabanı:</b> Bağlanmak istediğiniz veritabanı (varsayılan: master)</li>
                     <li><b>Kimlik Doğrulama:</b> Windows veya SQL Server Authentication</li>
                     <li><b>Otomatik Kayıt:</b> İlk bağlantıda ayarlar otomatik kaydedilir</li>

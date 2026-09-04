@@ -1,187 +1,251 @@
-"""
-SQL Server bağlantı yönetimi modülü
-"""
-import pyodbc
-from typing import Optional, Dict, Any, Tuple
+from __future__ import annotations
+
 import logging
+from dataclasses import dataclass
+from threading import Lock
+from typing import Any, List, Optional, Tuple
+
+import pyodbc
+
+from query_safety import validate_read_only_query
+
+
+MAX_RESULT_ROWS = 10000
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class QueryResult:
+    columns: List[str]
+    rows: List[Any]
+    truncated: bool = False
+
+
 class SQLConnection:
-    """SQL Server bağlantı yönetimi sınıfı"""
-    
     def __init__(self):
         self.connection: Optional[pyodbc.Connection] = None
-        self.server: str = ""
-        self.database: str = ""
-        self.auth_type: str = "Windows"  # Windows veya SQL Server
-        self.username: str = ""
-        self.password: str = ""
-    
-    def connect(self, server: str, database: str, auth_type: str = "Windows", 
-                username: str = "", password: str = "") -> Tuple[bool, str]:
-        """
-        SQL Server'a bağlan
-        
-        Args:
-            server: SQL Server adresi
-            database: Veritabanı adı
-            auth_type: Kimlik doğrulama tipi ("Windows" veya "SQL Server")
-            username: SQL Server kullanıcı adı (SQL Server Authentication için)
-            password: SQL Server şifresi (SQL Server Authentication için)
-        
-        Returns:
-            (başarılı mı, mesaj) tuple'ı
-        """
+        self.server = ""
+        self.database = ""
+        self.auth_type = "Windows"
+        self.username = ""
+        self._query_lock = Lock()
+
+    def connect(
+        self,
+        server: str,
+        database: str,
+        auth_type: str = "Windows",
+        username: str = "",
+        password: str = "",
+    ) -> Tuple[bool, str]:
+        if auth_type not in {"Windows", "SQL Server"}:
+            return False, "Desteklenmeyen kimlik doğrulama türü."
+
         try:
-            # Mevcut bağlantıyı kapat
             if self.connection:
                 self.connection.close()
-            
+                self.connection = None
+
+            connection_string = self._build_connection_string(
+                server,
+                database,
+                auth_type,
+                username,
+                password,
+            )
+            self.connection = pyodbc.connect(
+                connection_string,
+                timeout=10,
+                autocommit=False,
+            )
             self.server = server
             self.database = database
             self.auth_type = auth_type
             self.username = username
-            self.password = password
-            
-            # Connection string oluştur
-            if auth_type == "Windows":
-                conn_str = (
-                    f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-                    f"SERVER={server};"
-                    f"DATABASE={database};"
-                    f"Trusted_Connection=yes;"
-                )
-            else:  # SQL Server Authentication
-                conn_str = (
-                    f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-                    f"SERVER={server};"
-                    f"DATABASE={database};"
-                    f"UID={username};"
-                    f"PWD={password};"
-                )
-            
-            # Bağlantıyı aç
-            self.connection = pyodbc.connect(conn_str, timeout=10)
-            logger.info(f"SQL Server'a başarıyla bağlanıldı: {server}/{database}")
+            logger.info("SQL Server bağlantısı kuruldu")
             return True, "Bağlantı başarılı!"
-            
-        except pyodbc.Error as e:
-            error_msg = f"Bağlantı hatası: {str(e)}"
-            logger.error(error_msg)
-            return False, error_msg
-        except Exception as e:
-            error_msg = f"Beklenmeyen hata: {str(e)}"
-            logger.error(error_msg)
-            return False, error_msg
-    
+        except pyodbc.Error as error:
+            message = self._safe_connection_error(error, password)
+            logger.error(message)
+            return False, message
+        except Exception as error:
+            message = self._safe_connection_error(error, password)
+            logger.error(message)
+            return False, message
+
     def execute_query(self, query: str) -> Tuple[bool, Any, Optional[str]]:
-        """
-        SQL sorgusu çalıştır
-        
-        Args:
-            query: Çalıştırılacak SQL sorgusu
-        
-        Returns:
-            (başarılı mı, sonuçlar, hata mesajı) tuple'ı
-            Sonuçlar: List of tuples veya None
-        """
         if not self.connection:
             return False, None, "Önce SQL Server'a bağlanmalısınız!"
-        
+
+        allowed, reason = validate_read_only_query(query)
+        if not allowed:
+            return False, None, reason
+
+        if not self._query_lock.acquire(blocking=False):
+            return False, None, "Başka bir sorgu çalışırken yeni sorgu başlatılamaz."
+
+        cursor = None
         try:
             cursor = self.connection.cursor()
             cursor.execute(query)
-            
-            # SELECT sorgusu ise sonuçları al
-            if query.strip().upper().startswith('SELECT'):
-                results = cursor.fetchall()
-                columns = [column[0] for column in cursor.description]
-                return True, (columns, results), None
-            else:
-                # INSERT, UPDATE, DELETE gibi sorgular için commit
-                self.connection.commit()
-                affected_rows = cursor.rowcount
-                return True, f"{affected_rows} satır etkilendi.", None
-                
-        except pyodbc.Error as e:
-            error_msg = f"SQL Hatası: {str(e)}"
-            logger.error(error_msg)
-            return False, None, error_msg
-        except Exception as e:
-            error_msg = f"Beklenmeyen hata: {str(e)}"
-            logger.error(error_msg)
-            return False, None, error_msg
-    
+
+            while cursor.description is None:
+                if not cursor.nextset():
+                    self.connection.rollback()
+                    return True, QueryResult([], []), None
+
+            columns = [column[0] for column in cursor.description]
+            rows = list(cursor.fetchmany(MAX_RESULT_ROWS + 1))
+            truncated = len(rows) > MAX_RESULT_ROWS
+            if truncated:
+                rows = rows[:MAX_RESULT_ROWS]
+
+            self.connection.rollback()
+            return True, QueryResult(columns, rows, truncated), None
+        except pyodbc.Error as error:
+            self._rollback_quietly()
+            message = f"SQL Hatası: {error}"
+            logger.error(message)
+            return False, None, message
+        except Exception as error:
+            self._rollback_quietly()
+            message = f"Beklenmeyen hata: {error}"
+            logger.error(message)
+            return False, None, message
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    logger.debug("Cursor kapatılamadı", exc_info=True)
+            self._query_lock.release()
+
     def disconnect(self):
-        """Bağlantıyı kapat"""
         if self.connection:
             self.connection.close()
             self.connection = None
             logger.info("SQL Server bağlantısı kapatıldı")
-    
+
     def is_connected(self) -> bool:
-        """Bağlantı durumunu kontrol et"""
         if not self.connection:
             return False
+
+        cursor = None
         try:
             cursor = self.connection.cursor()
             cursor.execute("SELECT 1")
             return True
-        except:
+        except pyodbc.Error:
             return False
-    
+        except Exception:
+            logger.debug("Bağlantı durumu doğrulanamadı", exc_info=True)
+            return False
+        finally:
+            self._rollback_quietly()
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    logger.debug("Cursor kapatılamadı", exc_info=True)
+
     def get_databases(self) -> Tuple[bool, list, Optional[str]]:
-        """
-        Sunucudaki veritabanı listesini al
-        
-        Returns:
-            (başarılı mı, veritabanı listesi, hata mesajı) tuple'ı
-        """
         if not self.connection:
             return False, [], "Önce SQL Server'a bağlanmalısınız!"
-        
+
+        cursor = None
         try:
             cursor = self.connection.cursor()
             cursor.execute("SELECT name FROM sys.databases ORDER BY name")
             databases = [row[0] for row in cursor.fetchall()]
             return True, databases, None
-        except pyodbc.Error as e:
-            error_msg = f"Veritabanları alınırken hata: {str(e)}"
-            logger.error(error_msg)
-            return False, [], error_msg
-        except Exception as e:
-            error_msg = f"Beklenmeyen hata: {str(e)}"
-            logger.error(error_msg)
-            return False, [], error_msg
-    
+        except pyodbc.Error as error:
+            message = f"Veritabanları alınırken hata: {error}"
+            logger.error(message)
+            return False, [], message
+        except Exception as error:
+            message = f"Beklenmeyen hata: {error}"
+            logger.error(message)
+            return False, [], message
+        finally:
+            self._rollback_quietly()
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    logger.debug("Cursor kapatılamadı", exc_info=True)
+
     def change_database(self, database: str) -> Tuple[bool, str]:
-        """
-        Aktif veritabanını değiştir
-        
-        Args:
-            database: Yeni veritabanı adı
-        
-        Returns:
-            (başarılı mı, mesaj) tuple'ı
-        """
         if not self.connection:
             return False, "Önce SQL Server'a bağlanmalısınız!"
-        
-        try:
-            cursor = self.connection.cursor()
-            cursor.execute(f"USE [{database}]")
-            self.database = database
-            logger.info(f"Veritabanı değiştirildi: {database}")
-            return True, f"Veritabanı değiştirildi: {database}"
-        except pyodbc.Error as e:
-            error_msg = f"Veritabanı değiştirme hatası: {str(e)}"
-            logger.error(error_msg)
-            return False, error_msg
-        except Exception as e:
-            error_msg = f"Beklenmeyen hata: {str(e)}"
-            logger.error(error_msg)
-            return False, error_msg
 
+        cursor = None
+        try:
+            escaped_database = database.replace("]", "]]")
+            cursor = self.connection.cursor()
+            cursor.execute(f"USE [{escaped_database}]")
+            self.database = database
+            logger.info("Aktif veritabanı değiştirildi")
+            return True, f"Veritabanı değiştirildi: {database}"
+        except pyodbc.Error as error:
+            message = f"Veritabanı değiştirme hatası: {error}"
+            logger.error(message)
+            return False, message
+        except Exception as error:
+            message = f"Beklenmeyen hata: {error}"
+            logger.error(message)
+            return False, message
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    logger.debug("Cursor kapatılamadı", exc_info=True)
+
+    @staticmethod
+    def _build_connection_string(
+        server: str,
+        database: str,
+        auth_type: str,
+        username: str,
+        password: str,
+    ) -> str:
+        options = [
+            "DRIVER={ODBC Driver 17 for SQL Server}",
+            f"SERVER={SQLConnection._odbc_value(server)}",
+            f"DATABASE={SQLConnection._odbc_value(database)}",
+            "Encrypt=yes",
+            "TrustServerCertificate=no",
+        ]
+
+        if auth_type == "Windows":
+            options.append("Trusted_Connection=yes")
+        else:
+            options.extend(
+                [
+                    f"UID={SQLConnection._odbc_value(username)}",
+                    f"PWD={SQLConnection._odbc_value(password)}",
+                ]
+            )
+
+        return ";".join(options) + ";"
+
+    @staticmethod
+    def _odbc_value(value: str) -> str:
+        return "{" + str(value).replace("}", "}}") + "}"
+
+    @staticmethod
+    def _safe_connection_error(error: Exception, password: str) -> str:
+        text = str(error)
+        if password:
+            text = text.replace(password, "[REDACTED]")
+        return f"Bağlantı hatası: {text}"
+
+    def _rollback_quietly(self) -> None:
+        if not self.connection:
+            return
+        try:
+            self.connection.rollback()
+        except Exception:
+            logger.debug("Rollback tamamlanamadı", exc_info=True)

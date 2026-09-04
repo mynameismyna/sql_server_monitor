@@ -2,11 +2,11 @@
 
 ## Genel Uyumluluk
 
-Çoğu sorgu **SQL Server 2008 ve üzeri** versiyonlarda çalışır. Ancak bazı sorgular belirli gereksinimlere sahiptir.
+Çoğu sorgu **SQL Server 2008 ve üzeri** versiyonlarda çalışır. VLF sorgusu ve bazı özellik sorguları daha yeni sürüm veya ek bileşen gerektirir.
 
 ## Gerekli İzinler
 
-Çoğu sorgu için **VIEW SERVER STATE** veya **sysadmin** rolü gereklidir. Bazı sorgular için ek izinler:
+Çoğu sunucu tanılama sorgusu için **VIEW SERVER STATE** izni gerekir. Yalnızca sorgu çalıştırmak amacıyla `sysadmin` rolü verilmemelidir. Bazı sorgular için ek izinler:
 
 - **msdb** veritabanı sorguları: `msdb` veritabanına erişim
 - **distribution** veritabanı sorguları: Replication yapılandırması gerektirir
@@ -36,19 +36,35 @@
   - Çalışan Job'lar
 - **Not**: Agent servisi kapalıysa veya `msdb` erişimi yoksa sorgu hata verecektir
 
+### VLF (Virtual Log File)
+- **Gereksinim**: SQL Server 2016 SP2 veya üzeri
+- **Sorgu**: VLF (Virtual Log File) Sayısı
+- **Not**: `sys.dm_db_log_info` fonksiyonu ve ilgili performans durumu izni gereklidir
+
 ## Versiyon Uyumluluğu
 
 ### SQL Server 2008 / 2008 R2
 - Çoğu temel sorgu çalışır
 - Always On sorguları çalışmaz
+- VLF sorgusu çalışmaz
 - Bazı DMV'ler farklı kolonlar içerebilir
 
 ### SQL Server 2012 / 2014
 - Tüm temel sorgular çalışır
 - Always On sorguları Enterprise Edition'da çalışır
+- VLF sorgusu çalışmaz
 
 ### SQL Server 2016+
-- Tüm sorgular çalışır (özellik yüklüyse)
+- Temel sorgular çalışır; VLF sorgusu için SQL Server 2016 SP2 veya üzeri gerekir
+- Özellik sorguları yalnızca ilgili bileşen yapılandırılmışsa çalışır
+
+## Read-only Çalışma
+
+- Uygulama tek seferde yalnızca bir `SELECT` veya CTE sorgusu çalıştırır.
+- `INSERT`, `UPDATE`, `DELETE`, `MERGE`, DDL, `EXEC`, `DBCC`, backup/restore ve sunucu yönetim komutları engellenir.
+- Otomatik çalıştırma aynı read-only kurallara tabidir.
+- Sorgu sonuçları ilk 10.000 satırla sınırlandırılır.
+- Uygulama katmanındaki kontrol, SQL Server yetkilerinin yerine geçmez; bağlantı hesabı read-only ve en düşük yetkili olmalıdır.
 
 ## Hata Durumları
 
