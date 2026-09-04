@@ -10,7 +10,7 @@
 ## Teknik değişiklikler
 
 - Kod ve güvenlik değişiklikleri `22a0ec4c47c241803b30e99f8496104d313b65be` commit'iyle yayımlandı.
-- Yayın ağacı 22 izlenen dosyadan oluşmaktadır.
+- Kod ve testleri taşıyan ilk yayın ağacı 22 izlenen dosyadan oluşuyordu; bu yayın kaydının eklenmesiyle nihai `main` ağacı 23 dosyadır.
 - Uzak `main`, `d604ff79ad5cacd61113cf3fd5ed9b553f92879c` commit'inden normal ve geri alınabilir push ile ilerletildi.
 - Force-push veya Git geçmişini yeniden yazma işlemi yapılmadı.
 - Derlenmiş EXE, bağlantı yapılandırması, kullanıcı sorguları ve hassas anahtar dosyaları depoya eklenmedi.
@@ -31,8 +31,9 @@ Kaynak kurulum ve EXE üretim adımları `README.md` ile `BUILD_INSTRUCTIONS.md`
 - Dokuz Python dosyası AST kontrolünden geçti.
 - 71 çalıştırılabilir hazır sorgunun tamamı read-only politika kontrolünden geçti.
 - Geçici EXE derlemesi ve Windows ana pencere açılışı başarılı oldu.
-- GitHub Actions `Tests` çalışması Python 3.9, 3.11 ve 3.12 matrisinde başarılı oldu.
-- CI kaydı: `https://github.com/mynameismyna/sql_server_monitor/actions/runs/33850096232`
+- GitHub Actions `Tests` çalışmaları Python 3.9, 3.11 ve 3.12 matrisinde başarılı oldu.
+- Kod yayını CI kaydı: `https://github.com/mynameismyna/sql_server_monitor/actions/runs/33850096232`
+- Yayın dokümantasyonu CI kaydı: `https://github.com/mynameismyna/sql_server_monitor/actions/runs/33850364891`
 - Push sonrasında uzak ve yerel commit değerlerinin aynı olduğu doğrulandı.
 
 ## Güvenlik ve yetkilendirme
