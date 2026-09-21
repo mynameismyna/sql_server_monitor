@@ -7,14 +7,35 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QComboBox, QTextEdit, QTableWidget, QTableWidgetItem,
                              QGroupBox, QMessageBox, QHeaderView, QInputDialog,
                              QSplitter, QFileDialog, QDialog, QDialogButtonBox,
-                             QListWidget, QListWidgetItem, QMenuBar, QAction)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+                             QListWidget, QListWidgetItem, QMenuBar, QAction,
+                             QTextBrowser)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 from PyQt5.QtGui import QFont, QIntValidator
 import pandas as pd
 from datetime import datetime
 from sql_connection import QueryResult, SQLConnection
 from query_safety import validate_read_only_query
-from predefined_queries import PREDEFINED_QUERIES, get_all_queries, save_user_query, delete_user_query, load_user_queries, rename_user_query, get_user_query_categories
+from predefined_queries import (
+    PREDEFINED_QUERIES,
+    get_all_queries,
+    save_user_query,
+    delete_user_query,
+    load_user_queries,
+    rename_user_query,
+    get_user_query_categories,
+    get_query_description,
+    search_predefined_queries,
+    count_executable_queries,
+)
+from query_guides import (
+    format_guide_html,
+    format_situation_html,
+    format_symptom_html,
+    get_query_guide,
+    get_situation_playbooks,
+    get_sql_symptoms,
+    get_symptom_by_id,
+)
 from config_manager import ConfigManager
 
 
@@ -58,7 +79,7 @@ class SQLServerApp(QMainWindow):
     
     def init_ui(self):
         """Kullanıcı arayüzünü oluştur"""
-        self.setWindowTitle("SQL Sunucu Takip Uygulaması")
+        self.setWindowTitle("SQL Sunucu Takip — Gelişmiş Diagnostik")
         self.setGeometry(100, 100, 1400, 900)
         
         # Menü çubuğu oluştur
@@ -93,6 +114,42 @@ class SQLServerApp(QMainWindow):
         main_layout.addWidget(self.database_widget)
         
         # Hazır sorgular (bağlantıdan sonra görünecek, şimdilik gizli)
+        self._active_situation = None
+        self._active_symptom = None
+        self._loading_situation_queries = False
+        queries_outer = QVBoxLayout()
+        queries_outer.setContentsMargins(0, 0, 0, 0)
+        queries_outer.setSpacing(4)
+
+        situation_layout = QHBoxLayout()
+        situation_layout.addWidget(QLabel("Yaşadığım durum:"))
+        self.situation_combo = QComboBox()
+        self.situation_combo.addItem("-- Durum seçin (önerilen sorgu sırası) --", None)
+        for situation in get_situation_playbooks():
+            self.situation_combo.addItem(situation["title"], situation["id"])
+        self.situation_combo.currentIndexChanged.connect(self.on_situation_selected)
+        situation_layout.addWidget(self.situation_combo, 1)
+        queries_outer.addLayout(situation_layout)
+
+        symptom_layout = QHBoxLayout()
+        symptom_layout.addWidget(QLabel("SQL belirtisi:"))
+        self.symptom_combo = QComboBox()
+        self.symptom_combo.setEditable(False)
+        self.symptom_combo.addItem("-- SQL sunucu belirtisi seçin (wait / sinyal) --", None)
+        current_category = None
+        for symptom in get_sql_symptoms():
+            category = symptom.get("category") or "Diğer"
+            if category != current_category:
+                current_category = category
+                self.symptom_combo.addItem(f"── {category} ──", None)
+            self.symptom_combo.addItem(symptom["title"], symptom["id"])
+        self.symptom_combo.currentIndexChanged.connect(self.on_symptom_selected)
+        symptom_layout.addWidget(self.symptom_combo, 1)
+        self.clear_situation_btn = QPushButton("Filtreleri Temizle")
+        self.clear_situation_btn.clicked.connect(self.clear_situation_selection)
+        symptom_layout.addWidget(self.clear_situation_btn)
+        queries_outer.addLayout(symptom_layout)
+
         self.queries_layout = QHBoxLayout()
         
         # Kategori seçimi
@@ -105,9 +162,17 @@ class SQLServerApp(QMainWindow):
         # Sorgu seçimi
         self.queries_layout.addWidget(QLabel("Sorgu:"))
         self.predefined_combo = QComboBox()
+        self.predefined_combo.setEditable(False)
         self.predefined_combo.addItem("-- Sorgu seçin veya kendi sorgunuzu yazın --")
         self.predefined_combo.currentTextChanged.connect(self.on_predefined_query_selected)
         self.queries_layout.addWidget(self.predefined_combo, 1)
+
+        self.queries_layout.addWidget(QLabel("Ara:"))
+        self.query_search_input = QLineEdit()
+        self.query_search_input.setPlaceholderText("ör. blocking, backup, PLE...")
+        self.query_search_input.setMaximumWidth(220)
+        self.query_search_input.textChanged.connect(self.on_query_search_changed)
+        self.queries_layout.addWidget(self.query_search_input)
         
         # Butonlar
         self.add_query_btn = QPushButton("Sorguyu Kaydet")
@@ -119,9 +184,30 @@ class SQLServerApp(QMainWindow):
         self.manage_queries_btn.clicked.connect(self.manage_queries)
         self.manage_queries_btn.setEnabled(False)
         self.queries_layout.addWidget(self.manage_queries_btn)
+
+        queries_outer.addLayout(self.queries_layout)
+
+        guide_group = QGroupBox("Sorgu Rehberi / Durum Playbook")
+        guide_layout = QVBoxLayout()
+        guide_layout.setContentsMargins(6, 6, 6, 6)
+        self.query_guide_browser = QTextBrowser()
+        self.query_guide_browser.setOpenLinks(False)
+        self.query_guide_browser.anchorClicked.connect(self.on_guide_link_clicked)
+        self.query_guide_browser.setMinimumHeight(140)
+        self.query_guide_browser.setMaximumHeight(220)
+        self.query_guide_browser.setStyleSheet(
+            "QTextBrowser { background-color: #f8fafc; border: 1px solid #cbd5e1; padding: 6px; }"
+        )
+        self.query_guide_browser.setHtml(self._default_guide_html())
+        guide_layout.addWidget(self.query_guide_browser)
+        guide_group.setLayout(guide_layout)
+        queries_outer.addWidget(guide_group)
+
+        # Geriye dönük uyumluluk: eski kısa bilgi satırı yerine rehber paneli kullanılır
+        self.query_info_label = self.query_guide_browser
         
         self.queries_widget = QWidget()
-        self.queries_widget.setLayout(self.queries_layout)
+        self.queries_widget.setLayout(queries_outer)
         self.queries_widget.setVisible(False)
         main_layout.addWidget(self.queries_widget)
         
@@ -360,12 +446,168 @@ class SQLServerApp(QMainWindow):
             QMessageBox.warning(self, "Uyarı", message)
             self.statusBar().showMessage("Veritabanı değiştirilemedi")
     
+    def _default_guide_html(self) -> str:
+        return (
+            f"<p><b>{count_executable_queries()} hazır diagnostik sorgu</b> ve "
+            f"<b>{len(get_sql_symptoms())} SQL belirtisi</b> tanımlı.</p>"
+            "<p><b>Yaşadığım durum</b> ile genel senaryo playbook'u açın, "
+            "veya <b>SQL belirtisi</b> ile gördüğünüz wait/sinyale göre script seçin "
+            "(ör. <code>LCK_M_*</code>, <code>PAGEIOLATCH</code>, <code>PLE düşük</code>, "
+            "<code>LOG_BACKUP</code>).</p>"
+            "<p>Her scriptte ne zaman kullanılacağı, önce/sonra teyit zinciri ve "
+            "ilişkili belirtiler görünür.</p>"
+        )
+
+    def _set_guide_html(self, html: str):
+        if hasattr(self, "query_guide_browser"):
+            self.query_guide_browser.setHtml(html)
+
+    def _show_query_guide(self, query_name: str):
+        html = format_guide_html(query_name, get_query_guide(query_name), self._active_situation)
+        self._set_guide_html(html)
+
+    def clear_situation_selection(self):
+        self.situation_combo.blockSignals(True)
+        self.symptom_combo.blockSignals(True)
+        self.situation_combo.setCurrentIndex(0)
+        self.symptom_combo.setCurrentIndex(0)
+        self.situation_combo.blockSignals(False)
+        self.symptom_combo.blockSignals(False)
+        self._active_situation = None
+        self._active_symptom = None
+        self.query_search_input.blockSignals(True)
+        self.query_search_input.clear()
+        self.query_search_input.blockSignals(False)
+        self._set_guide_html(self._default_guide_html())
+        self.on_category_selected(self.category_combo.currentText())
+
+    def _load_query_sequence(self, query_names, header_label: str):
+        self.query_search_input.blockSignals(True)
+        self.query_search_input.clear()
+        self.query_search_input.blockSignals(False)
+        self._loading_situation_queries = True
+        self.predefined_combo.blockSignals(True)
+        self.predefined_combo.clear()
+        self.predefined_combo.addItem(header_label)
+        self.predefined_combo.addItems(query_names)
+        self.predefined_combo.blockSignals(False)
+        self._loading_situation_queries = False
+
+    def on_situation_selected(self, _index=None):
+        """Durum playbook seçildiğinde önerilen sorgu sırasını yükle."""
+        situation_id = self.situation_combo.currentData()
+        if not situation_id:
+            self._active_situation = None
+            if not self._active_symptom and not self.query_search_input.text().strip():
+                self._set_guide_html(self._default_guide_html())
+            return
+
+        playbooks = {item["id"]: item for item in get_situation_playbooks()}
+        situation = playbooks.get(situation_id)
+        if not situation:
+            return
+
+        self._active_symptom = None
+        self.symptom_combo.blockSignals(True)
+        self.symptom_combo.setCurrentIndex(0)
+        self.symptom_combo.blockSignals(False)
+
+        self._active_situation = situation
+        steps = situation.get("steps") or []
+        query_names = [step.get("query") for step in steps if step.get("query")]
+        self._load_query_sequence(query_names, f"-- Playbook: {len(query_names)} adımlı sıra --")
+        self._set_guide_html(format_situation_html(situation))
+        self.statusBar().showMessage(f"Durum playbook yüklendi: {situation.get('title', '')}")
+
+    def on_symptom_selected(self, _index=None):
+        """SQL belirtisine göre önerilen script listesini yükle."""
+        symptom_id = self.symptom_combo.currentData()
+        text = self.symptom_combo.currentText()
+        if not symptom_id:
+            if text.startswith("──"):
+                self.symptom_combo.blockSignals(True)
+                self.symptom_combo.setCurrentIndex(0)
+                self.symptom_combo.blockSignals(False)
+            self._active_symptom = None
+            if not self._active_situation and not self.query_search_input.text().strip():
+                self._set_guide_html(self._default_guide_html())
+            return
+
+        symptom = get_symptom_by_id(symptom_id)
+        if not symptom:
+            return
+
+        self._active_situation = None
+        self.situation_combo.blockSignals(True)
+        self.situation_combo.setCurrentIndex(0)
+        self.situation_combo.blockSignals(False)
+
+        self._active_symptom = symptom
+        query_names = [q for q in (symptom.get("queries") or []) if q]
+        self._load_query_sequence(
+            query_names,
+            f"-- Belirtiye özel {len(query_names)} script --",
+        )
+        self._set_guide_html(format_symptom_html(symptom))
+        self.statusBar().showMessage(f"SQL belirtisi seçildi: {symptom.get('title', '')}")
+
+    def on_guide_link_clicked(self, url: QUrl):
+        """Rehberdeki önce/sonra veya belirti linklerine tıklanınca yükle."""
+        href = url.toString()
+        if href.startswith("query:"):
+            self.load_named_query(href[len("query:"):])
+        elif href.startswith("symptom:"):
+            symptom_id = href[len("symptom:"):]
+            for i in range(self.symptom_combo.count()):
+                if self.symptom_combo.itemData(i) == symptom_id:
+                    self.symptom_combo.setCurrentIndex(i)
+                    break
+
+    def load_named_query(self, query_name: str):
+        """Ada göre sorguyu combo/editöre yükle."""
+        if not query_name:
+            return
+        all_queries = get_all_queries()
+        if query_name not in all_queries:
+            QMessageBox.information(self, "Bilgi", f"Sorgu bulunamadı: {query_name}")
+            return
+
+        index = self.predefined_combo.findText(query_name)
+        if index < 0:
+            self.predefined_combo.addItem(query_name)
+            index = self.predefined_combo.findText(query_name)
+        self.predefined_combo.setCurrentIndex(index)
+
     def on_category_selected(self, category):
         """Kategori seçildiğinde sorgu listesini güncelle"""
+        if getattr(self, "_loading_situation_queries", False):
+            return
+
+        # Durum/belirti aktifken kategori seçimi filtreyi temizler
+        if (self._active_situation or self._active_symptom) and not (
+            hasattr(self, "query_search_input") and self.query_search_input.text().strip()
+        ):
+            if category and not category.startswith("-- Kategori seçin"):
+                self._active_situation = None
+                self._active_symptom = None
+                self.situation_combo.blockSignals(True)
+                self.symptom_combo.blockSignals(True)
+                self.situation_combo.setCurrentIndex(0)
+                self.symptom_combo.setCurrentIndex(0)
+                self.situation_combo.blockSignals(False)
+                self.symptom_combo.blockSignals(False)
+
+        # Arama kutusu doluysa arama sonucu öncelikli kalsın
+        if hasattr(self, "query_search_input") and self.query_search_input.text().strip():
+            self.on_query_search_changed(self.query_search_input.text())
+            return
+
         self.predefined_combo.clear()
         
         if not category or category.startswith("-- Kategori seçin"):
             self.predefined_combo.addItem("-- Sorgu seçin veya kendi sorgunuzu yazın --")
+            if not self._active_situation and not self._active_symptom:
+                self._set_guide_html(self._default_guide_html())
             return
         
         # Kategori adından sorgu sayısını kaldır
@@ -374,15 +616,69 @@ class SQLServerApp(QMainWindow):
         all_queries = get_all_queries()
         
         if category_name == "Tüm Sorgular":
-            # Tüm sorguları göster (kategori başlıkları hariç)
             queries = sorted([q for q in all_queries.keys() if not q.startswith("===")])
             self.predefined_combo.addItem(f"-- {len(queries)} sorgu bulundu --")
             self.predefined_combo.addItems(queries)
+            self._set_guide_html(
+                f"<p><b>Tüm katalog:</b> {len(queries)} sorgu.</p>"
+                "<p>Bir sorgu seçin; rehber paneli ne zaman kullanılacağını ve "
+                "önce/sonra teyit zincirini gösterir. Belirli bir sorun için "
+                "<b>Yaşadığım durum</b> veya <b>SQL belirtisi</b> ile ilerleyin.</p>"
+            )
         else:
-            # Seçili kategorideki sorguları göster (sistem ve kullanıcı sorgularını birlikte)
             category_queries = sorted(self.get_queries_by_category(category_name, all_queries))
             self.predefined_combo.addItem(f"-- {len(category_queries)} sorgu bulundu --")
             self.predefined_combo.addItems(category_queries)
+            self._set_guide_html(
+                f"<p><b>Kategori:</b> {_html_escape(category_name)} "
+                f"({len(category_queries)} sorgu)</p>"
+                "<p>Listeden bir sorgu seçerek kullanım rehberini açın.</p>"
+            )
+
+    def on_query_search_changed(self, text):
+        """Ada/açıklamaya/rehbere göre hazır sorgu listesini filtrele."""
+        term = (text or "").strip()
+        self.predefined_combo.blockSignals(True)
+        self.predefined_combo.clear()
+
+        if not term:
+            self.predefined_combo.blockSignals(False)
+            if self._active_symptom:
+                self.on_symptom_selected()
+            elif self._active_situation:
+                self.on_situation_selected()
+            else:
+                current_category = self.category_combo.currentText()
+                self.on_category_selected(current_category)
+            return
+
+        # Arama yapılıyorsa durum/belirti filtresini temizle
+        if self._active_situation or self._active_symptom:
+            self._active_situation = None
+            self._active_symptom = None
+            self.situation_combo.blockSignals(True)
+            self.symptom_combo.blockSignals(True)
+            self.situation_combo.setCurrentIndex(0)
+            self.symptom_combo.setCurrentIndex(0)
+            self.situation_combo.blockSignals(False)
+            self.symptom_combo.blockSignals(False)
+
+        matches = search_predefined_queries(term)
+        user_queries = load_user_queries()
+        for name in user_queries:
+            if term.lower() in name.lower() and name not in matches:
+                matches.append(name)
+        matches = sorted(matches)
+
+        self.predefined_combo.addItem(f"-- {len(matches)} arama sonucu --")
+        self.predefined_combo.addItems(matches)
+        self.predefined_combo.blockSignals(False)
+        self._set_guide_html(
+            f"<p><b>Arama:</b> '{_html_escape(term)}' → {len(matches)} sonuç</p>"
+            "<p>Sonuçlar sorgu adı, özet, rehber ve SQL belirti metinlerinde aranır "
+            "(ör. <code>PAGEIOLATCH</code>, <code>PLE</code>, <code>LCK</code>). "
+            "Üstteki <b>SQL belirtisi</b> listesiyle de aynı sinyale gidebilirsiniz.</p>"
+        )
     
     def get_queries_by_category(self, category, all_queries):
         """Kategoriye göre sorguları filtrele"""
@@ -431,13 +727,21 @@ class SQLServerApp(QMainWindow):
                 
                 # Buton metnini "Sorguyu Düzenle" olarak değiştir
                 self.add_query_btn.setText("Sorguyu Düzenle")
+                self._show_query_guide(text)
         else:
             # Boş seçim yapıldığında normal moda dön
             self.selected_query_name = None
             self.edit_mode = False
             self.query_editor.setReadOnly(False)
             self.add_query_btn.setText("Sorguyu Kaydet")
-    
+            if self._active_symptom:
+                self._set_guide_html(format_symptom_html(self._active_symptom))
+            elif self._active_situation:
+                self._set_guide_html(format_situation_html(self._active_situation))
+            else:
+                self._set_guide_html(self._default_guide_html())
+
+
     def select_category_dialog(self, title, message):
         """Kategori seçimi dialog'u"""
         dialog = QDialog(self)
@@ -1479,6 +1783,17 @@ Gerekli İzinler:
 
 Detaylı bilgi için QUERY_COMPATIBILITY.md dosyasına bakın.
             """
+
+
+
+def _html_escape(value: str) -> str:
+    return (
+        (value or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
 
 
 def main():

@@ -4,6 +4,18 @@ Hazır analiz sorguları modülü
 import json
 import os
 
+from advanced_queries import ADVANCED_QUERIES, QUERY_DESCRIPTIONS
+from query_guides import (
+    QUERY_GUIDES,
+    format_guide_html,
+    format_situation_html,
+    get_query_guide,
+    get_situation_by_id,
+    get_situation_playbooks,
+    search_guides,
+    search_symptoms,
+)
+
 USER_QUERIES_FILE = "user_queries.json"
 
 PREDEFINED_QUERIES = {
@@ -47,13 +59,19 @@ PREDEFINED_QUERIES = {
     """,
     
     "SQL Server Hataları (Son 24 Saat)": """
-        -- Not: Bu sorgu xp_readerrorlog stored procedure'ünü kullanır
-        -- Sonuçları görmek için SQL Server Management Studio'da 
-        -- EXEC xp_readerrorlog 0, 1 komutunu çalıştırabilirsiniz
-        SELECT 
-            'Error Log' AS log_source,
-            GETDATE() AS current_time,
-            'Son 24 saatteki hataları görmek için SQL Server Management Studio''da EXEC xp_readerrorlog 0, 1 komutunu çalıştırın' AS note
+        -- xp_readerrorlog yerine ring buffer exception kayıtları (read-only)
+        SELECT TOP 200
+            DATEADD(ms, -1 * (osi.cpu_ticks / (osi.cpu_ticks / osi.ms_ticks) - rb.timestamp), GETDATE()) AS event_time,
+            CAST(rb.record AS XML).value('(//Error/ErrorCode)[1]', 'int') AS error_code,
+            CAST(rb.record AS XML).value('(//Error/Severity)[1]', 'int') AS severity,
+            CAST(rb.record AS XML).value('(//Error/State)[1]', 'int') AS state,
+            LEFT(CAST(rb.record AS XML).value('(//ErrorText)[1]', 'nvarchar(max)'), 500) AS error_text
+        FROM sys.dm_os_ring_buffers rb
+        CROSS JOIN sys.dm_os_sys_info osi
+        WHERE rb.ring_buffer_type = 'RING_BUFFER_EXCEPTION'
+          AND DATEADD(ms, -1 * (osi.cpu_ticks / (osi.cpu_ticks / osi.ms_ticks) - rb.timestamp), GETDATE())
+              >= DATEADD(HOUR, -24, GETDATE())
+        ORDER BY rb.timestamp DESC
     """,
     
     "Veritabanı Boyutları": """
@@ -1421,6 +1439,68 @@ PREDEFINED_QUERIES = {
         ORDER BY database_name
     """
 }
+
+# Gelişmiş diagnostik kataloğunu ekle (kategori sırası korunur)
+PREDEFINED_QUERIES.update(ADVANCED_QUERIES)
+
+# Temel sorgular için kısa açıklamalar (geriye dönük uyumluluk)
+QUERY_DESCRIPTIONS.update({
+    "Aktif Bağlantılar": "Kullanıcı oturumlarını CPU ve I/O ile listeler.",
+    "Yavaş Çalışan Sorgular": "Plan cache'den toplam elapsed time'a göre en yavaş sorguları getirir.",
+    "SQL Server Hataları (Son 24 Saat)": "Ring buffer üzerinden son 24 saatin exception kayıtlarını gösterir.",
+    "Bekleyen İşlemler (Blocking)": "Bloklanan istekleri ve blocking_session_id değerlerini listeler.",
+    "Eksik Indexler (Öneriler)": "DMV tabanlı eksik index önerilerini gösterir.",
+    "Fragmente Indexler": "Fragmentasyon oranı yüksek indexleri listeler.",
+    "TempDB Kullanımı": "TempDB alan ve oturum kullanımını özetler.",
+})
+
+# Rehber özetlerini kısa açıklama olarak da yayınla
+for _name, _guide in QUERY_GUIDES.items():
+    summary = (_guide.get("summary") or "").strip()
+    if summary and _name not in QUERY_DESCRIPTIONS:
+        QUERY_DESCRIPTIONS[_name] = summary
+
+
+def get_query_description(name: str) -> str:
+    """Seçili sorgu için kısa açıklama döndür."""
+    if name in QUERY_DESCRIPTIONS:
+        return QUERY_DESCRIPTIONS[name]
+    guide = get_query_guide(name)
+    return guide.get("summary", "")
+
+
+def search_predefined_queries(term: str):
+    """Ada, açıklamaya, rehbere veya SQL belirti metnine göre hazır sorgu ara."""
+    term_lower = (term or "").strip().lower()
+    if not term_lower:
+        return sorted(name for name in PREDEFINED_QUERIES if not name.startswith("==="))
+
+    guided = set(search_guides(term_lower))
+    for symptom in search_symptoms(term_lower):
+        guided.update(symptom.get("queries") or [])
+
+    results = set()
+    for name in PREDEFINED_QUERIES:
+        if name.startswith("==="):
+            continue
+        description = QUERY_DESCRIPTIONS.get(name, "")
+        if term_lower in name.lower() or term_lower in description.lower() or name in guided:
+            results.add(name)
+    return sorted(results)
+
+
+def get_predefined_categories():
+    """Hazır sorgu kategorilerini sırayla döndür."""
+    categories = []
+    for name in PREDEFINED_QUERIES:
+        if name.startswith("==="):
+            categories.append(name.replace("===", "").strip())
+    return categories
+
+
+def count_executable_queries():
+    """Çalıştırılabilir hazır sorgu sayısını döndür."""
+    return sum(1 for name in PREDEFINED_QUERIES if not name.startswith("==="))
 
 
 def load_user_queries():

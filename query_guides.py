@@ -1,0 +1,1417 @@
+"""
+Sorgu rehberleri ve durum bazlı playbook'lar.
+
+Her sorgu için: ne zaman kullanılmalı, hangi duruma fayda eder,
+önce/sonra çalıştırılacak teyit sorguları ve yorumlama ipuçları.
+"""
+
+from __future__ import annotations
+
+from typing import Dict, List, Optional
+
+
+def _guide(
+    summary: str,
+    when: str,
+    helps_with: List[str],
+    before: Optional[List[str]] = None,
+    after: Optional[List[str]] = None,
+    interpret: str = "",
+    tip: str = "",
+) -> dict:
+    return {
+        "summary": summary,
+        "when": when,
+        "helps_with": helps_with,
+        "before": before or [],
+        "after": after or [],
+        "interpret": interpret,
+        "tip": tip,
+    }
+
+
+QUERY_GUIDES: Dict[str, dict] = {
+    'Aktif Bağlantılar': _guide(
+        'Kullanıcı oturumlarını CPU, bellek ve I/O ile listeler.',
+        'Kim bağlı, hangi uygulama/host yoğunluk yaratıyor diye bakmak istediğinizde.',
+        ['Anlık yük artışı', 'Bağlantı sızıntısı şüphesi', 'Kimlik/uygulama envanteri'],
+        before=['Sunucu Anlık Durum Kartı'],
+        after=['Uygulama Bazlı Bağlantı Dağılımı', 'Idle Session ve Sleeping Connections', 'Aktif İşlemler'],
+        interpret='Çok sayıda sleeping + yüksek open_transaction_count varsa transaction sızıntısı olabilir.',
+        tip='Önce session_count dağılımına, sonra CPU/reads liderlerine bakın.',
+    ),
+    'Yavaş Çalışan Sorgular': _guide(
+        "Plan cache'den toplam elapsed time'a göre en pahalı sorguları getirir.",
+        "Kullanıcılar 'sistem yavaş' diyorsa ve suçlu SQL'i bulmak istiyorsanız.",
+        ['Genel yavaşlık', 'Timeout artışı', 'CPU/disk baskısı'],
+        before=['Sunucu Anlık Durum Kartı', 'Wait Statistics (Bekleme İstatistikleri)'],
+        after=['En Çok CPU Kullanan Sorgular', 'En Çok Logical Read Yapan Sorgular', 'Query Store En Yavaş Sorgular'],
+        interpret='total_elapsed yüksek ama avg düşükse çok sık çalışan sorgudur; avg yüksekse tek seferlik pahalıdır.',
+        tip='Sonucu Query Store ile teyit edin; plan cache restart sonrası sıfırlanır.',
+    ),
+    'SQL Server Hataları (Son 24 Saat)': _guide(
+        'Ring buffer exception kayıtlarını (son ~24 saat) listeler; xp_readerrorlog kullanmaz.',
+        'Ani hata artışı, login failure, severity yüksek exception şüphesinde.',
+        ['Uygulama hata logları', 'Bağlantı kopmaları', 'Severity 16+ hatalar'],
+        before=['Sunucu Anlık Durum Kartı'],
+        after=['Ring Buffer Exception Özeti', 'Ring Buffer Connectivity Hataları', 'Başarısız Login Ring Buffer'],
+        interpret='Aynı error_code tekrarlanıyorsa kök nedeni peşine düşün; tek seferlik gürültüyü ayırın.',
+        tip='Instance restart sonrası ring buffer boşalabilir.',
+    ),
+    'Veritabanı Boyutları': _guide(
+        "Tüm DB'lerin data+log toplam boyutunu MB/GB olarak gösterir.",
+        "Disk doluluk, capacity planning veya hangi DB'nin şiştiğini hızlı görmek için.",
+        ['Disk doluyor', 'Büyüme trendi', 'TempDB/user DB ayrımı'],
+        before=['Dosya Alanı ve Büyüme Riski'],
+        after=['Veritabanı Dosya Bilgileri', 'Tablo Boyutları ve Satır Sayıları', 'Autogrowth Olayları (Default Trace)'],
+        interpret='Ani boyut sıçramasında log mu data mı büyüdüğünü dosya sorgusuyla ayırın.',
+        tip='',
+    ),
+    'Bekleyen İşlemler (Blocking)': _guide(
+        'blocking_session_id <> 0 olan istekleri listeler.',
+        "Timeout, donma, 'kilitlendi' şikayetlerinde ilk kontrol.",
+        ['Blocking', 'LCK wait', 'Transaction uzun sürüyor'],
+        before=['Sunucu Anlık Durum Kartı', 'Aktif İşlemler'],
+        after=["Bloke'ye Sebep Olan Sorgular", 'Aktif Lock ve Wait Detayı', 'Açık Transaction ile Sleeping Session'],
+        interpret="Önce head blocker'ı bulun; zinciri wait chain ile teyit edin.",
+        tip='Blocking anlıktır; otomatik çalıştırmayla 5-10 sn aralıkla izleyin.',
+    ),
+    'En Çok CPU Kullanan Sorgular': _guide(
+        "Plan cache'de toplam worker time liderlerini gösterir.",
+        'CPU % yüksek, SOS_SCHEDULER_YIELD / CXPACKET belirginse.',
+        ['CPU baskısı', 'Paralel fırtına', 'Compile yoğunluğu'],
+        before=['Scheduler ve Runnable Task Yoğunluğu', 'Wait Statistics (Bekleme İstatistikleri)'],
+        after=['Top CPU Kullanan Planlar', 'Parameter Sniffing Adayları', 'Paralel Çalışan Sorgular'],
+        interpret='Aynı sorgu hem CPU hem logical read lideriyse index/plan sorununa bakın.',
+        tip='',
+    ),
+    'Aktif İşlemler': _guide(
+        "Şu an çalışan request'leri wait, CPU ve elapsed ile listeler.",
+        'Şu anda ne çalışıyor / kim bekliyor sorusunun cevabı için.',
+        ['Anlık yavaşlık', 'Blocking teyidi', 'Uzun request'],
+        before=['Sunucu Anlık Durum Kartı'],
+        after=['Bekleyen İşlemler (Blocking)', 'Memory Grant Bekleyen Sorgular', 'Wait Statistics (Bekleme İstatistikleri)'],
+        interpret='wait_type boş + running ise CPU; PAGEIOLATCH ise disk; LCK ise kilit.',
+        tip='',
+    ),
+    'Veritabanı Dosya Bilgileri': _guide(
+        "Aktif DB'nin logical/physical dosya boyutlarını listeler.",
+        "Belirli bir DB'nin data/log dosyalarını ve path'lerini görmek için.",
+        ['Dosya yerleşimi', 'Log şişmesi', 'Disk I/O hedefi'],
+        before=['Veritabanı Boyutları'],
+        after=['Transaction Log Durumu', 'Read/Write Latency Analizi', 'VLF (Virtual Log File) Sayısı'],
+        interpret="Log dosyası data'dan çok büyükse log backup / long transaction kontrol edin.",
+        tip='',
+    ),
+    'Tablo Satır Sayıları': _guide(
+        'Kullanıcı tablolarının satır ve alan tahminlerini verir.',
+        'Hangi tablonun şiştiğini veya beklenmedik büyümeyi görmek için.',
+        ['Tablo büyümesi', 'Archive ihtiyacı', 'Index kapasitesi'],
+        before=['Tablo Boyutları ve Satır Sayıları'],
+        after=['Fragmente Indexler', 'Statistics Güncellik Durumu'],
+        interpret='rows metadata tahminidir; kesin sayım değildir.',
+        tip='',
+    ),
+    "Bloke'ye Sebep Olan Sorgular": _guide(
+        'Bloklanan oturum ile blocker SQL metnini birlikte gösterir.',
+        "Blocking görüldükten sonra 'kim tutuyor, hangi SQL?' sorusu için.",
+        ['Head blocker bulma', 'Kilit zinciri'],
+        before=['Bekleyen İşlemler (Blocking)'],
+        after=['Aktif Lock ve Wait Detayı', 'Açık Transaction ve Log Kullanımı', 'Deadlock Bilgileri (Son 24 Saat)'],
+        interpret='blocking_text boşsa blocker idle transaction olabilir — sleeping+open tran sorgusuna gidin.',
+        tip='',
+    ),
+    'Bellek Kullanımı': _guide(
+        'Instance bellek tüketimi ve ilgili sayaçları özetler.',
+        'PLE düşük, memory grant pending veya OS bellek baskısında.',
+        ['Bellek baskısı', 'Paging şüphesi'],
+        before=['Page Life Expectancy ve Buffer Hit'],
+        after=['Memory Grant Bekleyen Sorgular', 'En Çok Bellek Kullanan Sorgular', 'Sistem Bellek Detayları'],
+        interpret='Target << Total ise thrashing; Grants Pending > 0 ise semaphore.',
+        tip='',
+    ),
+    'Disk I/O İstatistikleri': _guide(
+        'Dosya bazlı I/O stall ve okuma/yazma sayılarını gösterir.',
+        'PAGEIOLATCH / WRITELOG yüksekse veya disk latency şikayetinde.',
+        ['Yavaş disk', 'Log yazma gecikmesi', 'TempDB I/O'],
+        before=['Wait Statistics (Bekleme İstatistikleri)'],
+        after=['Read/Write Latency Analizi', 'Pending Disk I/O İstekleri', 'TempDB Dosya Dengesizliği'],
+        interpret='Avg latency > 20ms genelde uyarı; log için > 5-10ms bile önemli olabilir.',
+        tip='',
+    ),
+    'Wait Statistics (Bekleme İstatistikleri)': _guide(
+        'Instance ömrü boyunca birikmiş wait tiplerini sıralar.',
+        'Yavaşlığın sınıfını (CPU/IO/Lock/Network) hızlı sınıflandırmak için.',
+        ['Kök neden sınıflandırma', 'Performans triage'],
+        before=['Sunucu Anlık Durum Kartı'],
+        after=['CXPACKET / CXCONSUMER Wait Özeti', 'Aktif İşlemler', 'Yavaş Çalışan Sorgular'],
+        interpret='THREADPOOL kritik; PAGEIOLATCH disk; LCK kilit; CXPACKET paralellik.',
+        tip="Cumulative'dir; karşılaştırma için iki ölçüm arası farka bakın.",
+    ),
+    'Index Kullanım İstatistikleri': _guide(
+        'Seek/scan/lookup ve update sayılarını index bazında gösterir.',
+        "Index'in fayda edip etmediğini ölçmek için.",
+        ['Index bakımı', 'Yazma maliyeti'],
+        before=['Kullanılmayan Indexler'],
+        after=['Eksik Indexler (Öneriler)', 'Yinelenen / Çakışan Indexler', 'Fragmente Indexler'],
+        interpret='user_seeks+scans≈0 ve updates yüksekse aday drop; önce workload süresini doğrulayın.',
+        tip='İstatistikler restart/rebuild sonrası sıfırlanabilir.',
+    ),
+    'Kullanılmayan Indexler': _guide(
+        'Okuma görmeyen ama bakım maliyeti olan index adaylarını listeler.',
+        'Yazma yavaşlığı / gereksiz index şüphesinde.',
+        ['Index temizliği', 'OLTP yazma maliyeti'],
+        before=['Index Kullanım İstatistikleri'],
+        after=['Yinelenen / Çakışan Indexler', 'Eksik Indexler (Öneriler)'],
+        interpret='Primary/unique/FK destek indexlerini körlemesine silmeyin.',
+        tip='En az bir iş döngüsü (haftalık batch dahil) gözlemleyin.',
+    ),
+    'Eksik Indexler (Öneriler)': _guide(
+        "Optimizer'ın önerdiği eksik index DMV çıktısını gösterir.",
+        'Yüksek logical read / scan gören sorguları hızlandırmak için.',
+        ['Okuma yavaşlığı', 'Index tasarımı'],
+        before=['En Çok Logical Read Yapan Sorgular', 'Yavaş Çalışan Sorgular'],
+        after=['Index Kullanım İstatistikleri', 'Foreign Key Index Eksikleri'],
+        interpret='Her öneriyi uygulamayın; örtüşen önerileri birleştirin ve yazma maliyetini düşünün.',
+        tip='improvement_measure yüksek olanlardan başlayın.',
+    ),
+    'Deadlock Bilgileri (Son 24 Saat)': _guide(
+        'Sistemdeki deadlock ile ilgili bilgileri/izleri inceler.',
+        'Deadlock graph / 1205 hataları arttığında.',
+        ['Deadlock', 'Retry fırtınası'],
+        before=['Bekleyen İşlemler (Blocking)', 'Lock Bilgileri'],
+        after=["Bloke'ye Sebep Olan Sorgular", 'Aktif Lock ve Wait Detayı'],
+        interpret="Aynı kaynak çifti tekrarlanıyorsa erişim sırasını veya index'i gözden geçirin.",
+        tip='Extended Events deadlock_graph daha kesin kanıt sağlar.',
+    ),
+    'Transaction Log Durumu': _guide(
+        'Log kullanım yüzdesi ve log reuse wait açıklamasını verir.',
+        'Log doluyor, VLF çok, log backup gecikiyor şüphesinde.',
+        ['Log şişmesi', 'FULL recovery sorunları'],
+        before=['Veritabanı Dosya Bilgileri'],
+        after=['VLF (Virtual Log File) Sayısı', "Uzun Süren Transaction'lar", 'Log Backup Geçmişi'],
+        interpret='log_reuse_wait ACTIVE_TRANSACTION ise uzun tran; LOG_BACKUP ise log backup eksik.',
+        tip='',
+    ),
+    'Lock Bilgileri': _guide(
+        'Anlık lock sahiplik/isteklerini listeler.',
+        'Blocking varken hangi kaynak tipinin kilitlendiğini görmek için.',
+        ['Kilit analizi', 'Object/page/key lock'],
+        before=['Bekleyen İşlemler (Blocking)'],
+        after=['Aktif Lock ve Wait Detayı', "Bloke'ye Sebep Olan Sorgular"],
+        interpret='WAIT status satırları asıl mağdurlardır; GRANT + blocker session eşleştirin.',
+        tip='',
+    ),
+    'TempDB Kullanımı': _guide(
+        'TempDB alan ve oturum kullanımını özetler.',
+        'TempDB doluyor, version store / sort-spill şüphesinde.',
+        ['TempDB baskısı', 'Spill', 'Snapshot isolation'],
+        before=['Sunucu Anlık Durum Kartı'],
+        after=['Tempdb Contention Analizi', 'TempDB Dosya Dengesizliği', 'Açık Transaction ve Log Kullanımı'],
+        interpret='Tek dosyada I/O birikiyorsa dosya sayısı/dengesine bakın.',
+        tip='',
+    ),
+    'SQL Server Versiyon ve Yapılandırma': _guide(
+        'Sürüm, edition ve temel yapılandırma bilgisini verir.',
+        'Uyumluluk, CU seviyesi veya edition kısıtı doğrulamak için.',
+        ['Keşif', 'Destek hazırlığı'],
+        before=[],
+        after=['Varsayılan Olmayan Sunucu Ayarları', 'Sunucu Anlık Durum Kartı'],
+        interpret='Özellik sorguları (AG, Query Store) öncesi sürümü kontrol edin.',
+        tip='',
+    ),
+    'Plan Cache İstatistikleri': _guide(
+        "Cache'deki plan tipleri ve kullanım özetini verir.",
+        'Compile fırtınası veya ad-hoc şişme şüphesinde.',
+        ['Plan cache sağlığı'],
+        before=['Yüksek Compile / Recompile Oranı'],
+        after=['Ad-hoc Plan Cache Şişmesi', 'Tek Kullanımlık Pahalı Planlar'],
+        interpret='Adhoc + usecounts=1 oranı yüksekse optimize for ad hoc workloads düşünün.',
+        tip='',
+    ),
+    'Veritabanı Backup Durumu': _guide(
+        'DB bazında son backup zamanlarına dair özet sunar.',
+        'Yedek alınmış mı diye hızlı kontrol için.',
+        ['RPO kontrolü', 'Operasyon kontrol listesi'],
+        before=['RPO Riski - Backup Gecikmeleri'],
+        after=['Full Backup Geçmişi', 'Log Backup Geçmişi', 'Differential Backup Geçmişi'],
+        interpret='FULL recovery + log backup yoksa RPO riski kritiktir.',
+        tip='',
+    ),
+    'SQL Server Servis Durumu': _guide(
+        'Servis/agent ile ilgili durum bilgisini kontrol eder.',
+        'Job çalışmıyor veya Agent kapalı şüphesinde.',
+        ['Agent sorunları', 'Servis keşfi'],
+        before=[],
+        after=['SQL Agent Job Durumları', "Çalışan Job'lar"],
+        interpret='Agent kapalıysa job sorguları da başarısız olabilir.',
+        tip='',
+    ),
+    'En Çok Bellek Kullanan Sorgular': _guide(
+        'Yüksek bellek grant / bellek tüketen sorguları öne çıkarır.',
+        'Memory grant pending veya workspace memory yüksekse.',
+        ['Bellek grant', 'Hash/sort spill'],
+        before=['Memory Grant Bekleyen Sorgular', 'Page Life Expectancy ve Buffer Hit'],
+        after=['En Çok Logical Read Yapan Sorgular', 'Yavaş Çalışan Sorgular'],
+        interpret='Aşırı grant çoğu zaman kötü tahmin/istatistik veya büyük sort/hash demektir.',
+        tip='',
+    ),
+    'En Çok Çalıştırılan Sorgular': _guide(
+        'execution_count liderlerini listeler.',
+        'Sık çağrılan küçük sorguların toplam maliyeti için.',
+        ['Chatty uygulama', 'N+1 sorgu'],
+        before=['Yavaş Çalışan Sorgular'],
+        after=['En Çok CPU Kullanan Sorgular', 'Uygulama Bazlı Bağlantı Dağılımı'],
+        interpret='Tek maliyeti düşük ama count çok yüksek sorgular toplamda pahalıdır.',
+        tip='',
+    ),
+    'Paralel Çalışan Sorgular': _guide(
+        'Paralel plan / CX wait ile ilişkili pahalı sorguları inceler.',
+        'CXPACKET/CXCONSUMER veya DOP aşırıysa.',
+        ['Paralellik', 'CPU doygunluğu'],
+        before=['CXPACKET / CXCONSUMER Wait Özeti', 'Scheduler ve Runnable Task Yoğunluğu'],
+        after=['En Çok CPU Kullanan Sorgular', 'Varsayılan Olmayan Sunucu Ayarları'],
+        interpret='Cost Threshold / MAXDOP ayarlarını körlemesine değiştirmeden önce sorgu bazlı bakın.',
+        tip='',
+    ),
+    'Plan Cache Boyutu ve Kullanımı': _guide(
+        'Plan cache bellek ayak izini ve objtype dağılımını gösterir.',
+        'Bellek baskısı + ad-hoc workload birlikteyse.',
+        ['Cache şişmesi'],
+        before=['Ad-hoc Plan Cache Şişmesi'],
+        after=['Tek Kullanımlık Pahalı Planlar', 'Plan Cache İstatistikleri'],
+        interpret='',
+        tip='',
+    ),
+    'Veritabanı Durumları': _guide(
+        'ONLINE/RECOVERING/SUSPECT vb. DB state listesini verir.',
+        'Erişilemeyen DB veya recovery sonrası kontrol için.',
+        ['Availability', 'Suspect DB'],
+        before=['Sunucu Anlık Durum Kartı'],
+        after=['Suspect Pages (Bozuk Sayfa)', 'Veritabanı Backup Durumu'],
+        interpret='ONLINE olmayan DB varsa önce state_desc ve error log/ring buffer bakın.',
+        tip='',
+    ),
+    'Veritabanı Dosya Büyüme Durumu': _guide(
+        'Autogrowth ayarları ve dosya büyüme riskini listeler.',
+        'Ani latency spike veya sık autogrowth olayında.',
+        ['Autogrowth', 'Kapasite'],
+        before=['Autogrowth Olayları (Default Trace)'],
+        after=['Dosya Alanı ve Büyüme Riski', 'Veritabanı Dosya Bilgileri'],
+        interpret='Yüzdesel büyüme büyük dosyalarda uzun stall üretebilir.',
+        tip='',
+    ),
+    'Statistics Güncellik Durumu': _guide(
+        'İstatistik yaşını / güncellik durumunu inceler.',
+        'Ani plan regresyonu veya yanlış satır tahmininde.',
+        ['Kötü plan', 'Parameter sniffing teyidi'],
+        before=['Parameter Sniffing Adayları', 'Query Store Plan Regresyonları'],
+        after=['Missing Statistics', 'Yavaş Çalışan Sorgular'],
+        interpret='Eski istatistik + büyük tablo = sık regressiyon kaynağı.',
+        tip='',
+    ),
+    'Fragmente Indexler': _guide(
+        'Fragmentasyon oranı yüksek indexleri listeler.',
+        'Range scan yavaşlığı veya bakım penceresi planlarken.',
+        ['Index bakımı', 'I/O artışı'],
+        before=['Index Kullanım İstatistikleri'],
+        after=['Read/Write Latency Analizi', 'Heap Tablolar ve Forwarded Record'],
+        interpret='Küçük indexlerde yüksek % yanıltıcı olabilir; page_count eşiği kullanın.',
+        tip='Rebuild/reorganize bu araçla yapılmaz; sadece teşhis.',
+    ),
+    "SQL Server Login'leri": _guide(
+        'Sunucu login envanterini listeler.',
+        'Erişim gözden geçirme ve unused/disabled login avında.',
+        ['Güvenlik audit', 'Erişim envanteri'],
+        before=['Sysadmin ve Yüksek Yetkili Loginler'],
+        after=['Zayıf Login Politikaları', 'Orphaned Database Users'],
+        interpret="Disabled olmayan ama uzun süredir kullanılmayan login'leri işaretleyin.",
+        tip='',
+    ),
+    'Veritabanı Kullanıcıları': _guide(
+        'Aktif DB kullanıcılarını listeler.',
+        'DB içi yetki / orphan kontrolü öncesi envanter.',
+        ['Yetki gözden geçirme'],
+        before=['Orphaned Database Users'],
+        after=['Database Level İzinler'],
+        interpret='',
+        tip='',
+    ),
+    'Server Level İzinler': _guide(
+        'Sunucu seviyesi grant/role üyeliğini inceler.',
+        'Least privilege denetimi için.',
+        ['Güvenlik', 'Yetki şişmesi'],
+        before=['Sysadmin ve Yüksek Yetkili Loginler'],
+        after=['Database Level İzinler'],
+        interpret='sysadmin dışında gereksiz server permission arayın.',
+        tip='',
+    ),
+    'Database Level İzinler': _guide(
+        'DB seviyesi roller ve izinleri listeler.',
+        'Uygulama hesabı fazla yetkili mi diye bakmak için.',
+        ['Least privilege', 'db_owner şişmesi'],
+        before=['Veritabanı Kullanıcıları'],
+        after=['Server Level İzinler'],
+        interpret='Uygulama hesabında db_owner varsa azaltmayı değerlendirin.',
+        tip='',
+    ),
+    'Full Backup Geçmişi': _guide(
+        'msdb full backup geçmişini listeler.',
+        'Son başarılı full yedeği ve sıklığı doğrulamak için.',
+        ['RPO', 'Yedek denetimi'],
+        before=['RPO Riski - Backup Gecikmeleri'],
+        after=['Differential Backup Geçmişi', 'Log Backup Geçmişi'],
+        interpret='Başarısız/çok eski full varsa restore tatbikatı planlayın.',
+        tip='',
+    ),
+    'Differential Backup Geçmişi': _guide(
+        'Differential backup geçmişini listeler.',
+        'Full + diff stratejisini doğrulamak için.',
+        ['RPO optimize', 'Yedek zinciri'],
+        before=['Full Backup Geçmişi'],
+        after=['Log Backup Geçmişi'],
+        interpret="Diff, son full'e bağlıdır; full kopuksa zincir bozulur.",
+        tip='',
+    ),
+    'Log Backup Geçmişi': _guide(
+        'Transaction log backup geçmişini listeler.',
+        "FULL/BULK_LOGGED DB'lerde RPO'nun can damarı.",
+        ['Point-in-time restore', 'Log şişmesi kök nedeni'],
+        before=['Transaction Log Durumu', 'RPO Riski - Backup Gecikmeleri'],
+        after=["Uzun Süren Transaction'lar", 'VLF (Virtual Log File) Sayısı'],
+        interpret='Log backup kesilmişse log dosyası büyür ve truncate olmaz.',
+        tip='',
+    ),
+    'SQL Agent Job Durumları': _guide(
+        'Job enabled/disabled ve son durum özetini verir.',
+        'Job neden çalışmadı / başarısız mı diye ilk bakış.',
+        ['Operasyon', 'ETL/backup job'],
+        before=['Job Başarı Oranı (Son 7 Gün)'],
+        after=["Başarısız Job'lar", "Çalışan Job'lar", "Uzun Süredir Çalışmayan Job'lar"],
+        interpret='Enabled=1 ama long idle ise schedule veya Agent sorunudur.',
+        tip='',
+    ),
+    "Başarısız Job'lar": _guide(
+        "Yakın dönemde fail olan job'ları listeler.",
+        "Gece job'ları kırmızıya döndüğünde.",
+        ['Job failure', 'Operasyon alarmı'],
+        before=['SQL Agent Job Durumları'],
+        after=['Job Başarı Oranı (Son 7 Gün)', 'Database Mail Queue'],
+        interpret="Aynı step tekrar fail ediyorsa çıktı mesajını/msdb history'yi inceleyin.",
+        tip='',
+    ),
+    "Çalışan Job'lar": _guide(
+        "Şu an çalışan Agent job'larını gösterir.",
+        'Job takıldı mı, çakışma var mı diye bakmak için.',
+        ['Long running job', 'Maintenance çakışması'],
+        before=['SQL Agent Job Durumları'],
+        after=['Aktif İşlemler', 'Bekleyen İşlemler (Blocking)'],
+        interpret='Index rebuild + ETL aynı anda ise blocking/IO spike bekleyin.',
+        tip='',
+    ),
+    'Availability Groups Durumu': _guide(
+        'AG sağlık/senkron durumunu özetler.',
+        'AG ortamında failover veya lag şüphesinde.',
+        ['HA/DR', 'Senkron kaybı'],
+        before=['AG Senkronizasyon Gecikmesi'],
+        after=['Availability Replicas', 'AG Listener ve Endpoint Durumu'],
+        interpret='synchronization_health unhealthy ise redo/log send kuyruğuna bakın.',
+        tip='AG yoksa sorgu hata verir — beklenen.',
+    ),
+    'Availability Replicas': _guide(
+        'Replica rolleri ve bağlantı durumunu listeler.',
+        'Secondary bağlı mı / role doğru mu kontrolü.',
+        ['Replica envanteri'],
+        before=['Availability Groups Durumu'],
+        after=['AG Senkronizasyon Gecikmesi'],
+        interpret='',
+        tip='',
+    ),
+    'Replication Yayıncıları': _guide(
+        'Replication publisher bilgisini listeler.',
+        'Replication kurulu ortamlarda yayıncı sağlığı için.',
+        ['Replication'],
+        before=[],
+        after=['Replication Aboneleri'],
+        interpret='distribution DB yoksa hata normaldir.',
+        tip='',
+    ),
+    'Replication Aboneleri': _guide(
+        'Subscriber/latency bilgisini inceler.',
+        'Replication gecikmesi veya undelivered komut şüphesinde.',
+        ['Replication lag'],
+        before=['Replication Yayıncıları'],
+        after=[],
+        interpret='',
+        tip='',
+    ),
+    'Connection Pool İstatistikleri': _guide(
+        'Bağlantı havuzu / session dağılımı ipuçları verir.',
+        'Uygulama pool exhaustion veya ani session patlamasında.',
+        ['Pool şişmesi', 'Bağlantı sızıntısı'],
+        before=['Uygulama Bazlı Bağlantı Dağılımı'],
+        after=['Idle Session ve Sleeping Connections', 'Uzun Süreli Bağlantılar'],
+        interpret='Sleeping sayısı çok yüksekse uygulama bağlantıyı leave open bırakıyor olabilir.',
+        tip='',
+    ),
+    'Uzun Süreli Bağlantılar': _guide(
+        'Uzun zamandır açık oturumları listeler.',
+        'Leak veya unutulan SSMS/ETL oturumlarını bulmak için.',
+        ['Session leak'],
+        before=['Aktif Bağlantılar'],
+        after=['Idle Session ve Sleeping Connections', 'Açık Transaction ile Sleeping Session'],
+        interpret='Idle + open_transaction_count > 0 kritik; blocking üretebilir.',
+        tip='',
+    ),
+    'Tablo Boyutları ve Satır Sayıları': _guide(
+        'Tablo bazlı alan ve satır özetini verir.',
+        'En büyük nesneleri ve arşiv adaylarını bulmak için.',
+        ['Kapasite', 'Arşiv'],
+        before=['Veritabanı Boyutları'],
+        after=['Fragmente Indexler', 'Partition ve Filegroup Dağılımı'],
+        interpret='',
+        tip='',
+    ),
+    'Stored Procedure Listesi': _guide(
+        'SP envanterini listeler.',
+        'Keşif / dokümantasyon / yetki gözden geçirme.',
+        ['Envanter'],
+        before=[],
+        after=['View Listesi', 'Trigger Listesi'],
+        interpret='',
+        tip='',
+    ),
+    'View Listesi': _guide(
+        'View envanterini listeler.',
+        'Keşif ve bağımlılık analizi öncesi.',
+        ['Envanter'],
+        before=['Stored Procedure Listesi'],
+        after=[],
+        interpret='',
+        tip='',
+    ),
+    'Trigger Listesi': _guide(
+        'DML/DDL trigger envanterini listeler.',
+        'Gizli yazma maliyeti veya yan etki şüphesinde.',
+        ['Yavaş INSERT/UPDATE', 'Beklenmeyen yan etki'],
+        before=[],
+        after=['Yavaş Çalışan Sorgular', 'Deadlock Bilgileri (Son 24 Saat)'],
+        interpret='Çok sayıda trigger deadlock ve yavaş yazma üretebilir.',
+        tip='',
+    ),
+    'CPU Kullanım İstatistikleri': _guide(
+        'CPU ile ilgili performans sayaçlarını özetler.',
+        'OS/SQL CPU ayrımı ve yoğunluk teyidi için.',
+        ['CPU baskısı'],
+        before=['Scheduler ve Runnable Task Yoğunluğu'],
+        after=['En Çok CPU Kullanan Sorgular', 'CXPACKET / CXCONSUMER Wait Özeti'],
+        interpret='runnable_tasks_count sürekli > 0 ise CPU kuyruğu vardır.',
+        tip='',
+    ),
+    'Sistem Bellek Detayları': _guide(
+        'OS/SQL bellek kırılımını daha detaylı gösterir.',
+        'PLE düşükken bellek kimin kullandığını ayırmak için.',
+        ['Bellek triage'],
+        before=['Page Life Expectancy ve Buffer Hit', 'Bellek Kullanımı'],
+        after=['Memory Broker Clerks', 'Memory Grant Bekleyen Sorgular'],
+        interpret='',
+        tip='',
+    ),
+    'Network İstatistikleri': _guide(
+        'Ağ ile ilgili wait/trafik ipuçlarını verir.',
+        'ASNYC_NETWORK_IO yüksek veya client yavaş tüketiyorsa.',
+        ['Client yavaşlığı', 'Büyük result set'],
+        before=['Wait Statistics (Bekleme İstatistikleri)'],
+        after=['Aktif İşlemler', 'Yavaş Çalışan Sorgular'],
+        interpret="Çok satır çeken raporlar client'ı boğuyorsa network wait artar.",
+        tip='',
+    ),
+    'Query Store En Yavaş Sorgular': _guide(
+        'Query Store runtime istatistiklerinden en yavaşları getirir.',
+        'Plan cache güvenilmezse (restart sonrası) tarihsel yavaşlık için.',
+        ['Tarihsel regresyon', 'Kalıcı yavaş sorgular'],
+        before=['Query Store Durum Özeti'],
+        after=['Query Store Plan Regresyonları', 'Yavaş Çalışan Sorgular'],
+        interpret='Query Store kapalıysa hata alırsınız — önce durum özetine bakın.',
+        tip='',
+    ),
+    'Query Store Plan Regresyonları': _guide(
+        'Daha kötü plana kaymış sorguları bulmaya yardım eder.',
+        "Dün hızlı bugün yavaş' senaryolarında.",
+        ['Plan regression', 'Deploy sonrası yavaşlık'],
+        before=['Query Store En Yavaş Sorgular', 'Statistics Güncellik Durumu'],
+        after=['Parameter Sniffing Adayları'],
+        interpret='Regresyon varsa istatistik/parametre/index değişimini kontrol edin.',
+        tip='',
+    ),
+    "Uzun Süren Transaction'lar": _guide(
+        "Uzun açık transaction'ları listeler.",
+        'Log truncate olmuyor veya blocking head idle ise.',
+        ['Long tran', 'Log reuse'],
+        before=['Transaction Log Durumu'],
+        after=['Açık Transaction ve Log Kullanımı', 'Açık Transaction ile Sleeping Session'],
+        interpret="SSMS'de unutulmuş BEGIN TRAN klasik kök nedendir.",
+        tip='',
+    ),
+    'Memory Broker Clerks': _guide(
+        'Bellek clerk kırılımını gösterir.',
+        'Hangi tüketicinin (cache, grant, clerk) bellek aldığını görmek için.',
+        ['Bellek kırılımı'],
+        before=['Sistem Bellek Detayları'],
+        after=['Ad-hoc Plan Cache Şişmesi', 'Memory Grant Bekleyen Sorgular'],
+        interpret='CACHESTORE_SQLCP şişmesi ad-hoc plan göstergesi olabilir.',
+        tip='',
+    ),
+    'Database Mirror Durumu': _guide(
+        'Eski mirroring durumunu kontrol eder.',
+        'Mirroring kullanan miras ortamlarda.',
+        ['DR miras'],
+        before=[],
+        after=['Log Shipping Durumu', 'Availability Groups Durumu'],
+        interpret="Mirroring yoksa boş/hata normal; AG'ye bakın.",
+        tip='',
+    ),
+    'Log Shipping Durumu': _guide(
+        'Log shipping gecikme/job durumunu inceler.',
+        'Log shipping DR topolojilerinde.',
+        ['DR lag'],
+        before=['Log Backup Geçmişi'],
+        after=['RPO Riski - Backup Gecikmeleri'],
+        interpret='',
+        tip='',
+    ),
+    'Resource Governor Yapılandırması': _guide(
+        'RG pool/workload group ayarlarını listeler.',
+        'RG aktif ortamlarda throttle şüphesinde.',
+        ['Kaynak sınırlama'],
+        before=[],
+        after=['Memory Grant Bekleyen Sorgular', 'CPU Kullanım İstatistikleri'],
+        interpret='RG yoksa sonuç boş olabilir.',
+        tip='',
+    ),
+    'Bekleme Zincirleri (Wait Chains)': _guide(
+        'Blocking wait zincirini (kim kimi bekliyor) çıkarır.',
+        "Çok katmanlı blocking'de head blocker bulmak için.",
+        ['Blocking zinciri'],
+        before=['Bekleyen İşlemler (Blocking)'],
+        after=["Bloke'ye Sebep Olan Sorgular", 'Aktif Lock ve Wait Detayı'],
+        interpret="Zincirin kökündeki session'ı hedefleyin; yaprakları değil.",
+        tip='',
+    ),
+    'VLF (Virtual Log File) Sayısı': _guide(
+        'Log VLF sayısını verir (2016 SP2+).',
+        'Log backup/truncate sorunları veya yavaş recovery şüphesinde.',
+        ['Çok VLF', 'Recovery süresi'],
+        before=['Transaction Log Durumu'],
+        after=['Log Backup Geçmişi', 'Autogrowth Olayları (Default Trace)'],
+        interpret='Yüzlerce/ binlerce VLF sağlıksızdır; büyüme stratejisini düzeltin.',
+        tip='',
+    ),
+    'Columnstore Index Analizleri': _guide(
+        'Columnstore sağlık/kullanım ipuçlarını listeler.',
+        'Columnstore kullanan DW iş yüklerinde.',
+        ['DW', 'Columnstore'],
+        before=[],
+        after=['Fragmente Indexler', 'Yavaş Çalışan Sorgular'],
+        interpret='Özellik yoksa hata/boş sonuç normal.',
+        tip='',
+    ),
+    'Tempdb Contention Analizi': _guide(
+        'TempDB allocation contention belirtilerini arar.',
+        'PAGELATCH_UP/EX on TempDB veya yavaş temp object yaratımında.',
+        ['TempDB latch', 'Concurrent temp table'],
+        before=['TempDB Kullanımı'],
+        after=['TempDB Dosya Dengesizliği', 'Latch Contention Top'],
+        interpret='Çok dosya + eşit boyut genelde contention azaltır.',
+        tip='',
+    ),
+    'Missing Statistics': _guide(
+        'Eksik istatistik sinyallerini / adayları inceler.',
+        'Uyarı 4143 veya kötü kardinalite tahmininde.',
+        ['Kötü plan'],
+        before=['Statistics Güncellik Durumu'],
+        after=['Yavaş Çalışan Sorgular', 'Eksik Indexler (Öneriler)'],
+        interpret='',
+        tip='',
+    ),
+    'Top CPU Kullanan Planlar': _guide(
+        'Query hash bazında CPU lider planları özetler.',
+        'CPU fırtınasında plan seviyesinde gruplu bakış için.',
+        ['CPU triage'],
+        before=['En Çok CPU Kullanan Sorgular'],
+        after=['Parameter Sniffing Adayları', 'Paralel Çalışan Sorgular'],
+        interpret='',
+        tip='',
+    ),
+    'Read/Write Latency Analizi': _guide(
+        'Dosya bazlı avg read/write latency hesaplar.',
+        "I/O root-cause'u dosya seviyesinde kanıtlamak için.",
+        ['Disk latency'],
+        before=['Disk I/O İstatistikleri'],
+        after=['Pending Disk I/O İstekleri', 'TempDB Dosya Dengesizliği'],
+        interpret="Data ve log latency'yi ayrı yorumlayın; log daha hassastır.",
+        tip='',
+    ),
+    'Database Mail Queue': _guide(
+        'Database Mail kuyruk/gönderim durumunu listeler.',
+        'Alert mail gelmiyor veya job bildirimleri başarısızsa.',
+        ['Alerting', 'Mail failure'],
+        before=["Başarısız Job'lar"],
+        after=[],
+        interpret='sent_status başarısız kayıtları profil/SMTP sorununa işaret eder.',
+        tip='',
+    ),
+    'Database Encryption Key Durumu': _guide(
+        'TDE encryption state ve sertifika süresini gösterir.',
+        "TDE açık DB'lerde key/cert expiry ve encryption progress için.",
+        ['TDE', 'Compliance'],
+        before=['Sertifika ve Key Son Kullanım Tarihleri'],
+        after=['Veritabanı Durumları'],
+        interpret='Cert expiry yaklaşımı restore/DR için kritik risk.',
+        tip='',
+    ),
+    'Sunucu Anlık Durum Kartı': _guide(
+        'Oturum, blocking, bellek ve offline DB sayılarını tek bakışta verir.',
+        "Her incident'in ilk 30 saniyesinde; neyin bozuk olduğunu sınıflandırmak için.",
+        ['Triage başlangıcı', 'Sağlık check'],
+        before=[],
+        after=['Wait Statistics (Bekleme İstatistikleri)', 'Aktif İşlemler', 'Page Life Expectancy ve Buffer Hit'],
+        interpret='blocked_requests > 0 → blocking dalı; offline_dbs → availability dalı; değilse wait/CPU/IO.',
+        tip="Playbook'ların çoğunun ilk adımıdır.",
+    ),
+    'Page Life Expectancy ve Buffer Hit': _guide(
+        'PLE, buffer hit ve memory grant pending sayaçlarını okur.',
+        'Bellek baskısı veya ani I/O artışı şüphesinde.',
+        ['Bellek', 'Cache thrash'],
+        before=['Sunucu Anlık Durum Kartı'],
+        after=['Memory Grant Bekleyen Sorgular', 'En Çok Physical Read Yapan Sorgular', 'Sistem Bellek Detayları'],
+        interpret='PLE düşük + physical read yüksek = bellek veya kötü plan.',
+        tip="Tek seferlik PLE dip'i yanıltıcı olabilir; trend izleyin.",
+    ),
+    'Scheduler ve Runnable Task Yoğunluğu': _guide(
+        "CPU kuyruğu ve pending disk I/O'yu scheduler bazında gösterir.",
+        'CPU mi disk mi diye anlık ayırım için.',
+        ['CPU kuyruğu', 'I/O kuyruğu'],
+        before=['Sunucu Anlık Durum Kartı'],
+        after=['En Çok CPU Kullanan Sorgular', 'Pending Disk I/O İstekleri'],
+        interpret='runnable_tasks_count yüksek → CPU; pending_disk_io yüksek → storage.',
+        tip='',
+    ),
+    'Memory Grant Bekleyen Sorgular': _guide(
+        'RESOURCE_SEMAPHORE / grant bekleyen istekleri listeler.',
+        "Sorgular 'çalışmıyor gibi' ama wait memory ise.",
+        ['Memory semaphore', 'Büyük sort/hash'],
+        before=['Page Life Expectancy ve Buffer Hit'],
+        after=['En Çok Bellek Kullanan Sorgular', 'Aktif İşlemler'],
+        interpret='requested << granted veya grant_time NULL ise kuyruk var demektir.',
+        tip='',
+    ),
+    'Pending Disk I/O İstekleri': _guide(
+        'Dosya stall toplamlarına göre en sorunlu dosyaları sıralar.',
+        'I/O wait yüksekken hangi DB/dosya suçlu diye bakmak için.',
+        ['Storage hotspot'],
+        before=['Disk I/O İstatistikleri'],
+        after=['Read/Write Latency Analizi', 'TempDB Dosya Dengesizliği'],
+        interpret='',
+        tip='',
+    ),
+    'Ad-hoc Plan Cache Şişmesi': _guide(
+        'Adhoc/prepared plan sayısı ve single-use oranını gösterir.',
+        'Plan cache bellek yiyor veya compile yüksekse.',
+        ['Ad-hoc workload', 'Compile fırtınası'],
+        before=['Yüksek Compile / Recompile Oranı'],
+        after=['Tek Kullanımlık Pahalı Planlar', 'Varsayılan Olmayan Sunucu Ayarları'],
+        interpret='single_use_pct çok yüksekse parametrize veya optimize for ad hoc.',
+        tip='',
+    ),
+    'Tek Kullanımlık Pahalı Planlar': _guide(
+        'usecounts=1 iken pahalı CPU tüketen ad-hoc planları listeler.',
+        'Cache şişmesi + CPU birlikteyse.',
+        ['Ad-hoc pahalı sorgular'],
+        before=['Ad-hoc Plan Cache Şişmesi'],
+        after=['Yavaş Çalışan Sorgular', 'En Çok CPU Kullanan Sorgular'],
+        interpret='',
+        tip='',
+    ),
+    'Yüksek Compile / Recompile Oranı': _guide(
+        'Compilation/recompile sayaçlarını batch request ile birlikte gösterir.',
+        "CPU'nun plan üretmeye gittiği şüphesinde.",
+        ['Compile CPU'],
+        before=['Scheduler ve Runnable Task Yoğunluğu'],
+        after=['Ad-hoc Plan Cache Şişmesi', 'Plan Cache İstatistikleri'],
+        interpret="Compilations/sec, Batch Requests'e yakınsa sorunlu.",
+        tip='',
+    ),
+    'Parameter Sniffing Adayları': _guide(
+        'Aynı query_hash için yüksek CPU varyanslı planları bulur.',
+        'Bazen hızlı bazen çok yavaş aynı SP/sorgu için.',
+        ['Parameter sniffing', 'Kararsız süre'],
+        before=['Query Store Plan Regresyonları'],
+        after=['Statistics Güncellik Durumu', 'Yavaş Çalışan Sorgular'],
+        interpret='cpu_variance_ratio yüksekse farklı parametrelerle plan kararsızlığı vardır.',
+        tip='',
+    ),
+    'En Çok Logical Read Yapan Sorgular': _guide(
+        'Toplam logical read liderlerini listeler.',
+        'CPU makul ama I/O/buffer baskısı varsa.',
+        ['Scan ağır iş', 'Eksik index'],
+        before=['Yavaş Çalışan Sorgular'],
+        after=['Eksik Indexler (Öneriler)', 'En Çok Physical Read Yapan Sorgular'],
+        interpret='Yüksek logical read çoğu zaman yanlış index/plan demektir.',
+        tip='',
+    ),
+    'En Çok Physical Read Yapan Sorgular': _guide(
+        "Disk'ten okuyan (physical read) sorguları listeler.",
+        'PLE düşük ve PAGEIOLATCH yüksekken.',
+        ['Cold cache', 'Bellek yetmezliği'],
+        before=['Page Life Expectancy ve Buffer Hit'],
+        after=['En Çok Logical Read Yapan Sorgular', 'Read/Write Latency Analizi'],
+        interpret="Physical ≈ logical ise veri cache'e sığmıyor olabilir.",
+        tip='',
+    ),
+    'CXPACKET / CXCONSUMER Wait Özeti': _guide(
+        "Paralellik ve seçilmiş kritik wait'leri özetler.",
+        'Paralel planların fayda mı zarar mı ettiğini görmek için.',
+        ['Paralellik wait'],
+        before=['Wait Statistics (Bekleme İstatistikleri)'],
+        after=['Paralel Çalışan Sorgular', 'Scheduler ve Runnable Task Yoğunluğu'],
+        interpret='CXCONSUMER modern sürümlerde beklenen pay olabilir; THREADPOOL asıl kırmızı bayraktır.',
+        tip='',
+    ),
+    'Latch Contention Top': _guide(
+        "En çok beklenen latch class'larını sıralar.",
+        'PAGELATCH / ACCESS_METHODS contention şüphesinde.',
+        ['Latch', 'TempDB contention'],
+        before=['Tempdb Contention Analizi'],
+        after=['TempDB Dosya Dengesizliği', 'Aktif İşlemler'],
+        interpret='',
+        tip='',
+    ),
+    'Yinelenen / Çakışan Indexler': _guide(
+        'Aynı key kolonlara sahip potansiyel yinelenen indexleri bulur.',
+        'Yazma maliyeti yüksek, index sayısı şişkinse.',
+        ['Index temizliği'],
+        before=['Kullanılmayan Indexler'],
+        after=['Index Kullanım İstatistikleri', 'Foreign Key Index Eksikleri'],
+        interpret='Include kolon farklarını da gözden geçirmeden silmeyin.',
+        tip='',
+    ),
+    'Primary Key Olmayan Tablolar': _guide(
+        "PK'siz user table listesini verir.",
+        'Tasarım/replication/CDC ve kalite denetiminde.',
+        ['Schema kalitesi'],
+        before=[],
+        after=['Heap Tablolar ve Forwarded Record', 'Foreign Key Index Eksikleri'],
+        interpret='Heap + forwarded record birlikteyse özellikle kritik.',
+        tip='',
+    ),
+    'Foreign Key Index Eksikleri': _guide(
+        "FK kolonlarında destek index'i olmayan ilişkileri bulur.",
+        "Parent delete/update veya join'ler yavaşsa.",
+        ['FK performansı', 'Lock escalation riski'],
+        before=['Eksik Indexler (Öneriler)'],
+        after=['Index Kullanım İstatistikleri', 'Deadlock Bilgileri (Son 24 Saat)'],
+        interpret='FK index eksikliği deadlock ve scan üretebilir.',
+        tip='',
+    ),
+    'Heap Tablolar ve Forwarded Record': _guide(
+        'Heap tabloları ve forwarded record sayılarını listeler.',
+        'Heap üzerinde ağır okuma/update varsa.',
+        ['Forwarded records', 'Heap maliyeti'],
+        before=['Primary Key Olmayan Tablolar'],
+        after=['Fragmente Indexler', 'En Çok Logical Read Yapan Sorgular'],
+        interpret='forwarded_record_count > 0 ise cluster index veya rebuild stratejisi düşünün.',
+        tip='',
+    ),
+    'Identity Kapasiteye Yaklaşan Kolonlar': _guide(
+        'Identity kolonların tip limitine yaklaşma oranını hesaplar.',
+        'int identity overflow öncesi erken uyarı için.',
+        ['Overflow riski'],
+        before=[],
+        after=['Tablo Satır Sayıları'],
+        interpret="pct_used > %80 ise bigint'e geçiş planlayın.",
+        tip='',
+    ),
+    'Partition ve Filegroup Dağılımı': _guide(
+        'Partition/filegroup alan dağılımını gösterir.',
+        'Partitioned table kapasite ve FG dengesizliği için.',
+        ['Partitioning', 'Filegroup'],
+        before=['Tablo Boyutları ve Satır Sayıları'],
+        after=['Dosya Alanı ve Büyüme Riski'],
+        interpret='',
+        tip='',
+    ),
+    'RPO Riski - Backup Gecikmeleri': _guide(
+        'Full/diff/log gecikmesine göre RPO riskini sınıflandırır.',
+        'Yedek alarmı, audit veya log şişmesi kök neden aramasında.',
+        ['RPO', 'Backup SLA'],
+        before=['Veritabanı Backup Durumu'],
+        after=['Full Backup Geçmişi', 'Log Backup Geçmişi', 'Transaction Log Durumu'],
+        interpret="Önce 'Full backup yok' ve 'Log backup yok' satırlarını çözün.",
+        tip='',
+    ),
+    'Suspect Pages (Bozuk Sayfa)': _guide(
+        'msdb suspect_pages kayıtlarını listeler.',
+        '823/824, checksum, torn page şüphesinde.',
+        ['Corruption sinyali'],
+        before=['Veritabanı Durumları', 'Ring Buffer Exception Özeti'],
+        after=['Veritabanı Backup Durumu', 'Read/Write Latency Analizi'],
+        interpret='Kayıt varsa storage/DBCC yönünde ilerleyin; bu araç DBCC çalıştırmaz.',
+        tip='',
+    ),
+    'Autogrowth Olayları (Default Trace)': _guide(
+        "Default trace'ten data/log autogrowth olaylarını okur.",
+        'Ani latency spike zamanı ile büyüme olayını eşlemek için.',
+        ['Autogrowth stall'],
+        before=['Veritabanı Dosya Büyüme Durumu'],
+        after=['Dosya Alanı ve Büyüme Riski', 'Read/Write Latency Analizi'],
+        interpret='Sık growth = dosya önceden büyütülmeli / growth adımı gözden geçirilmeli.',
+        tip='Default trace kapalıysa sonuç gelmez.',
+    ),
+    'Sysadmin ve Yüksek Yetkili Loginler': _guide(
+        'sysadmin ve diğer yüksek server role üyelerini listeler.',
+        'Güvenlik gözden geçirme ve excess privilege avında.',
+        ['Yetki audit'],
+        before=["SQL Server Login'leri"],
+        after=['Zayıf Login Politikaları', 'Server Level İzinler'],
+        interpret='Servis/uygulama hesaplarında sysadmin olmamalı.',
+        tip='',
+    ),
+    'Zayıf Login Politikaları': _guide(
+        "Policy/expiration kapalı SQL login'leri listeler.",
+        'Compliance ve brute-force risk azaltmada.',
+        ['Parola politikası'],
+        before=['Sysadmin ve Yüksek Yetkili Loginler'],
+        after=['Başarısız Login Ring Buffer'],
+        interpret='Özellikle sysadmin + policy off kombinasyonu kritik.',
+        tip='',
+    ),
+    'Orphaned Database Users': _guide(
+        "Login'i olmayan DB user'ları bulur.",
+        'Restore/migration sonrası erişim hatalarında.',
+        ['Orphan user', 'Login map'],
+        before=['Veritabanı Kullanıcıları'],
+        after=["SQL Server Login'leri", 'Database Level İzinler'],
+        interpret="Uygulama login map kopuksa 'login failed' veya permission hataları görülür.",
+        tip='',
+    ),
+    'Sertifika ve Key Son Kullanım Tarihleri': _guide(
+        'Certificate expiry durumunu listeler.',
+        'TDE, mirroring, endpoint cert yenileme takibi için.',
+        ['Cert expiry'],
+        before=['Database Encryption Key Durumu'],
+        after=['AG Listener ve Endpoint Durumu'],
+        interpret='30 gün kala yenileme planı yapın.',
+        tip='',
+    ),
+    'Linked Server Envanteri': _guide(
+        'Linked server ve güvenlik bayraklarını listeler.',
+        'Remote query yavaşlığı veya güvenlik yüzeyi denetiminde.',
+        ['Linked server', 'RPC out'],
+        before=[],
+        after=['Aktif İşlemler', 'Yavaş Çalışan Sorgular'],
+        interpret='is_rpc_out_enabled gereksiz açıksa kapatmayı değerlendirin.',
+        tip='',
+    ),
+    'Başarısız Login Ring Buffer': _guide(
+        'Ring buffer exception içinden login/hata izlerini okur.',
+        'Login failed fırtınası veya brute-force şüphesinde.',
+        ['Login failure', 'Güvenlik'],
+        before=['SQL Server Hataları (Son 24 Saat)'],
+        after=['Zayıf Login Politikaları', 'Ring Buffer Connectivity Hataları'],
+        interpret='Aynı IP/hesap tekrarları için firewall/audit tarafını devreye alın.',
+        tip='',
+    ),
+    'Job Başarı Oranı (Son 7 Gün)': _guide(
+        'Job bazında 7 günlük başarı yüzdesini hesaplar.',
+        "Kronik flaky job'ları bulmak için.",
+        ['Job güvenilirliği'],
+        before=["Başarısız Job'lar"],
+        after=["Uzun Süredir Çalışmayan Job'lar", 'Database Mail Queue'],
+        interpret="success_pct düşük job'ları önce stabilize edin.",
+        tip='',
+    ),
+    "Uzun Süredir Çalışmayan Job'lar": _guide(
+        "Enabled olup 7+ gündür çalışmayan job'ları bulur.",
+        'Schedule bozulması veya Agent sessizliği için.',
+        ['Missed schedule'],
+        before=['SQL Agent Job Durumları'],
+        after=["Çalışan Job'lar", 'Job Başarı Oranı (Son 7 Gün)'],
+        interpret='',
+        tip='',
+    ),
+    'AG Senkronizasyon Gecikmesi': _guide(
+        'Redo/log send kuyrukları ve commit gecikmesini gösterir.',
+        'Secondary geride / rapor gecikmeli / failover riski.',
+        ['AG lag', 'DR RPO/RTO'],
+        before=['Availability Groups Durumu'],
+        after=['AG Listener ve Endpoint Durumu', 'Disk I/O İstatistikleri'],
+        interpret='redo_queue_size büyümesi secondary CPU/IO veya network sorununa işaret eder.',
+        tip='',
+    ),
+    'AG Listener ve Endpoint Durumu': _guide(
+        "Listener DNS/port ve HADR endpoint state'ini listeler.",
+        "Bağlantı listener'a gidmiyor veya endpoint sorununda.",
+        ['Listener', 'HADR endpoint'],
+        before=['Availability Groups Durumu'],
+        after=['Sertifika ve Key Son Kullanım Tarihleri'],
+        interpret='',
+        tip='',
+    ),
+    'TempDB Dosya Dengesizliği': _guide(
+        'TempDB data dosyaları arasında boyut/I/O paylaşımını karşılaştırır.',
+        'TempDB contention veya tek dosya hotspot şüphesinde.',
+        ['TempDB denge'],
+        before=['TempDB Kullanımı', 'Tempdb Contention Analizi'],
+        after=['Latch Contention Top', 'Read/Write Latency Analizi'],
+        interpret='Dosya boyutları eşit değilse autogrowth yarışı olabilir.',
+        tip='',
+    ),
+    'Açık Transaction ve Log Kullanımı': _guide(
+        "Açık tran'ları log byte kullanımıyla listeler.",
+        'Log reuse ACTIVE_TRANSACTION iken suçluyu bulmak için.',
+        ['Long tran', 'Log büyümesi'],
+        before=['Transaction Log Durumu', "Uzun Süren Transaction'lar"],
+        after=['Açık Transaction ile Sleeping Session', "Bloke'ye Sebep Olan Sorgular"],
+        interpret='En eski transaction_begin_time genelde kök nedendir.',
+        tip='',
+    ),
+    'Aktif Lock ve Wait Detayı': _guide(
+        "WAIT lock'ları ve blocking_session_id ile nesne bilgisini birleştirir.",
+        "Blocking'i obje/seviye bazında kanıtlamak için.",
+        ['Lock detay'],
+        before=['Bekleyen İşlemler (Blocking)', 'Lock Bilgileri'],
+        after=["Bloke'ye Sebep Olan Sorgular", 'Bekleme Zincirleri (Wait Chains)'],
+        interpret='',
+        tip='',
+    ),
+    'Varsayılan Olmayan Sunucu Ayarları': _guide(
+        'Kritik/sp_configure sapmalarını listeler.',
+        'MAXDOP, max memory, xp_cmdshell gibi ayar denetiminde.',
+        ['Config drift', 'Güvenlik ayarı'],
+        before=['SQL Server Versiyon ve Yapılandırma'],
+        after=['Resource Governor Yapılandırması', 'Veritabanı Scoped Configuration'],
+        interpret='xp_cmdshell / Ole Automation açıksa güvenlik riski.',
+        tip='value <> value_in_use ise restart/pending config vardır.',
+    ),
+    'Veritabanı Scoped Configuration': _guide(
+        'DB scoped config (MAXDOP, legacy CE vb.) değerlerini listeler.',
+        'DB bazlı performans davranışı farklıysa.',
+        ['DB config'],
+        before=['Varsayılan Olmayan Sunucu Ayarları'],
+        after=['Query Store Durum Özeti', 'Parameter Sniffing Adayları'],
+        interpret='',
+        tip='',
+    ),
+    'Dosya Alanı ve Büyüme Riski': _guide(
+        "Max size'a yaklaşma ve agresif growth ayarlarını işaretler.",
+        'Disk dolmadan önce dosya riskini görmek için.',
+        ['Kapasite riski'],
+        before=['Veritabanı Boyutları'],
+        after=['Autogrowth Olayları (Default Trace)', 'Veritabanı Dosya Büyüme Durumu'],
+        interpret='',
+        tip='',
+    ),
+    'Query Store Durum Özeti': _guide(
+        'Query Store açık mı, doluluk ve capture modunu gösterir.',
+        'QS sorgularına geçmeden önce önkoşul kontrolü.',
+        ['Query Store hazırlık'],
+        before=[],
+        after=['Query Store En Yavaş Sorgular', 'Query Store Plan Regresyonları'],
+        interpret='readonly_reason doluluk yüzünden olabilir; storage_used_pct izleyin.',
+        tip='',
+    ),
+    'CDC / Change Tracking Durumu': _guide(
+        'CDC ve Change Tracking açık mı gösterir.',
+        'Change tracking beklenmedik yük/log etkisi şüphesinde.',
+        ['CDC', 'CT'],
+        before=[],
+        after=['Transaction Log Durumu', 'Tablo Boyutları ve Satır Sayıları'],
+        interpret='',
+        tip='',
+    ),
+    'Service Broker Kuyruk Derinliği': _guide(
+        'User queue satır sayılarını ve activation bayraklarını listeler.',
+        'SB mesaj birikiyor / işlenmiyor şüphesinde.',
+        ['Service Broker'],
+        before=[],
+        after=['Aktif İşlemler', "Çalışan Job'lar"],
+        interpret='approximate_rows artıyorsa activation kapalı veya okuyucu yetersiz olabilir.',
+        tip='',
+    ),
+    'In-Memory OLTP Kullanımı': _guide(
+        'Memory-optimized tablo bellek kullanımını listeler.',
+        'XTP bellek baskısı veya In-Memory envanteri için.',
+        ['In-Memory OLTP'],
+        before=['Sistem Bellek Detayları'],
+        after=['Bellek Kullanımı'],
+        interpret='Özellik yoksa boş/hata normal.',
+        tip='',
+    ),
+    'Temporal Tablo Envanteri': _guide(
+        'Temporal table + history eşleşmelerini listeler.',
+        'History tablosu şişmesi veya temporal keşfi için.',
+        ['Temporal', 'History büyümesi'],
+        before=['Tablo Boyutları ve Satır Sayıları'],
+        after=['Veritabanı Boyutları'],
+        interpret='',
+        tip='',
+    ),
+    'Uygulama Bazlı Bağlantı Dağılımı': _guide(
+        'program/host/login bazında session yoğunluğunu gruplar.',
+        'Hangi uygulamanın bağlantı patlattığını bulmak için.',
+        ['Connection storm', 'Pool'],
+        before=['Aktif Bağlantılar'],
+        after=['Connection Pool İstatistikleri', 'Idle Session ve Sleeping Connections'],
+        interpret='Tek program_name altında anormal session_count sızıntı göstergesi olabilir.',
+        tip='',
+    ),
+    'Idle Session ve Sleeping Connections': _guide(
+        '30+ dk idle sleeping oturumları listeler.',
+        'Pool şişmesi ve gereksiz bağlantı avında.',
+        ['Idle connection'],
+        before=['Uygulama Bazlı Bağlantı Dağılımı'],
+        after=['Açık Transaction ile Sleeping Session', 'Uzun Süreli Bağlantılar'],
+        interpret='Idle tek başına masum olabilir; open tran ile birlikteyse tehlikeli.',
+        tip='',
+    ),
+    'Açık Transaction ile Sleeping Session': _guide(
+        'Sleeping olduğu halde transaction açık oturumları bulur.',
+        "Blocking'in görünmeyen head blocker'ı çoğu zaman budur.",
+        ['Idle blocker', 'Orphan tran'],
+        before=['Bekleyen İşlemler (Blocking)', "Uzun Süren Transaction'lar"],
+        after=['Açık Transaction ve Log Kullanımı', "Bloke'ye Sebep Olan Sorgular"],
+        interpret="Bu oturumlar log truncate'i ve kilidi tutmaya devam eder.",
+        tip='',
+    ),
+    'Ring Buffer Exception Özeti': _guide(
+        "Son exception'ları severity/code ile listeler.",
+        'Error log yerine hızlı exception tarama için.',
+        ['Exception triage'],
+        before=['SQL Server Hataları (Son 24 Saat)'],
+        after=['Ring Buffer Connectivity Hataları', 'Suspect Pages (Bozuk Sayfa)'],
+        interpret='',
+        tip='',
+    ),
+    'Ring Buffer Connectivity Hataları': _guide(
+        'Connectivity ring buffer kayıtlarını getirir.',
+        'Ani disconnect, login handshake, network reset şüphesinde.',
+        ['Bağlantı kopması'],
+        before=['Ring Buffer Exception Özeti'],
+        after=['Başarısız Login Ring Buffer', 'Network İstatistikleri'],
+        interpret='',
+        tip='',
+    ),
+    'Ring Buffer Scheduler Monitor': _guide(
+        'Scheduler monitor ring buffer kayıtlarını listeler.',
+        'Non-yielding scheduler / ciddi CPU donması şüphesinde.',
+        ['Scheduler health'],
+        before=['Scheduler ve Runnable Task Yoğunluğu'],
+        after=['En Çok CPU Kullanan Sorgular', 'Ring Buffer Exception Özeti'],
+        interpret='Bu kayıtlar ciddiye alınmalı; dump/XE ile derinleştirin.',
+        tip='',
+    ),
+}
+
+
+SITUATION_PLAYBOOKS: List[dict] = [
+    {
+        'id': 'triage',
+        'title': 'Genel: Sistem yavaş / ne olduğunu bilmiyorum',
+        'symptoms': 'Kullanıcı şikayeti var ama kök neden sınıfı belirsiz.',
+        'goal': 'CPU / I/O / Lock / Bellek / Availability ayrımı yapıp doğru dala geçmek.',
+        'steps': [{'query': 'Sunucu Anlık Durum Kartı', 'note': 'Blocked, session, offline DB sayılarına bakın.'}, {'query': 'Wait Statistics (Bekleme İstatistikleri)', 'note': 'Üst wait tipine göre dal seçin.'}, {'query': 'Aktif İşlemler', 'note': "Anlık wait_type ve uzun request'leri görün."}, {'query': 'Scheduler ve Runnable Task Yoğunluğu', 'note': 'CPU kuyruğu mu, disk mi?'}, {'query': 'Page Life Expectancy ve Buffer Hit', 'note': 'Bellek baskısı var mı?'}, {'query': 'Yavaş Çalışan Sorgular', 'note': 'Suçlu SQL adaylarını çıkarın.'}],
+    },
+    {
+        'id': 'blocking',
+        'title': 'Blocking / uygulama kilitleniyor / timeout',
+        'symptoms': 'Timeout, donma, LCK_M_* wait, işlemler sıraya giriyor.',
+        'goal': "Head blocker ve tutulan transaction/SQL'i bulmak.",
+        'steps': [{'query': 'Sunucu Anlık Durum Kartı', 'note': 'blocked_requests > 0 mı?'}, {'query': 'Bekleyen İşlemler (Blocking)', 'note': 'Mağdur session listesi.'}, {'query': 'Bekleme Zincirleri (Wait Chains)', 'note': 'Zincirin kökünü bulun.'}, {'query': "Bloke'ye Sebep Olan Sorgular", 'note': 'Blocker SQL metnini alın.'}, {'query': 'Açık Transaction ile Sleeping Session', 'note': 'Idle blocker var mı?'}, {'query': 'Aktif Lock ve Wait Detayı', 'note': 'Hangi nesne/lock tipi?'}, {'query': 'Deadlock Bilgileri (Son 24 Saat)', 'note': 'Deadlock da eşlik ediyor mu?'}],
+    },
+    {
+        'id': 'cpu',
+        'title': 'CPU çok yüksek',
+        'symptoms': 'CPU %90+, runnable queue, SOS_SCHEDULER_YIELD / CXPACKET.',
+        'goal': 'CPU yiyen sorgu/planı ve paralellik/compile etkisini ayırmak.',
+        'steps': [{'query': 'Scheduler ve Runnable Task Yoğunluğu', 'note': 'Runnable queue kanıtı.'}, {'query': 'En Çok CPU Kullanan Sorgular', 'note': 'Suçlu SQL.'}, {'query': 'Top CPU Kullanan Planlar', 'note': 'Query hash gruplu bakış.'}, {'query': 'CXPACKET / CXCONSUMER Wait Özeti', 'note': 'Paralellik payı.'}, {'query': 'Yüksek Compile / Recompile Oranı', 'note': 'Compile CPU mı?'}, {'query': 'Parameter Sniffing Adayları', 'note': 'Kararsız plan var mı?'}],
+    },
+    {
+        'id': 'io',
+        'title': 'Disk / I/O yavaşlığı',
+        'symptoms': 'PAGEIOLATCH_*, WRITELOG, yüksek latency, raporlar diskte takılıyor.',
+        'goal': "Hangi dosya/DB'nin yavaşladığını ve suçlu sorguları bulmak.",
+        'steps': [{'query': 'Wait Statistics (Bekleme İstatistikleri)', 'note': 'I/O wait sınıfını teyit.'}, {'query': 'Read/Write Latency Analizi', 'note': 'Dosya bazlı avg latency.'}, {'query': 'Pending Disk I/O İstekleri', 'note': 'Hotspot dosyalar.'}, {'query': 'En Çok Physical Read Yapan Sorgular', 'note': 'Disk okuyan SQL.'}, {'query': 'TempDB Dosya Dengesizliği', 'note': 'TempDB tek dosya mı?'}, {'query': 'Autogrowth Olayları (Default Trace)', 'note': 'Growth stall zamanlaması.'}],
+    },
+    {
+        'id': 'memory',
+        'title': 'Bellek baskısı / PLE düşük',
+        'symptoms': 'PLE düşüşü, memory grant pending, paging, ani physical read artışı.',
+        'goal': 'Bellek tüketicisini ve grant kuyruğunu bulmak.',
+        'steps': [{'query': 'Page Life Expectancy ve Buffer Hit', 'note': 'PLE / hit / grants pending.'}, {'query': 'Memory Grant Bekleyen Sorgular', 'note': 'Semaphore bekleyenler.'}, {'query': 'En Çok Bellek Kullanan Sorgular', 'note': 'Büyük grant SQL.'}, {'query': 'Sistem Bellek Detayları', 'note': 'Clerk kırılımı.'}, {'query': 'Ad-hoc Plan Cache Şişmesi', 'note': 'Cache bellek yiyor mu?'}, {'query': 'En Çok Physical Read Yapan Sorgular', 'note': 'Cache thrash sonucu.'}],
+    },
+    {
+        'id': 'slow_query',
+        'title': 'Belirli sorgu / SP yavaşladı',
+        'symptoms': 'Dün hızlı bugün yavaş, tek rapor/SP timeout.',
+        'goal': 'Plan regresyonu, istatistik, sniffing veya index ihtiyacını ayırmak.',
+        'steps': [{'query': 'Query Store Durum Özeti', 'note': 'QS açık ve yazılabilir mi?'}, {'query': 'Query Store Plan Regresyonları', 'note': 'Kötü plana kaymış mı?'}, {'query': 'Query Store En Yavaş Sorgular', 'note': 'Tarihsel pahalı sorgular.'}, {'query': 'Parameter Sniffing Adayları', 'note': 'Varyans yüksek mi?'}, {'query': 'Statistics Güncellik Durumu', 'note': 'Eski istatistik?'}, {'query': 'Eksik Indexler (Öneriler)', 'note': 'DMV önerileri (dikkatli uygulayın).'}, {'query': 'En Çok Logical Read Yapan Sorgular', 'note': 'Scan maliyeti.'}],
+    },
+    {
+        'id': 'tempdb',
+        'title': 'TempDB sorunu',
+        'symptoms': 'TempDB doluyor, PAGELATCH contention, spill, version store.',
+        'goal': 'Alan, contention ve dengesiz dosya kullanımını ayırmak.',
+        'steps': [{'query': 'TempDB Kullanımı', 'note': 'Kim alan tutuyor?'}, {'query': 'Tempdb Contention Analizi', 'note': 'Allocation contention.'}, {'query': 'TempDB Dosya Dengesizliği', 'note': 'Dosya eşitliği / I/O payı.'}, {'query': 'Latch Contention Top', 'note': 'Latch class doğrulama.'}, {'query': 'Açık Transaction ve Log Kullanımı', 'note': 'Version store uzun tran?'}, {'query': 'Aktif İşlemler', 'note': 'Spill/sort yapan request.'}],
+    },
+    {
+        'id': 'log_rpo',
+        'title': 'Log şişiyor / yedek RPO riski',
+        'symptoms': 'Log dosyası büyüyor, disk doluyor, restore noktası garanti değil.',
+        'goal': 'Log reuse nedenini ve backup gecikmesini bulmak.',
+        'steps': [{'query': 'RPO Riski - Backup Gecikmeleri', 'note': 'Full/log gecikme sınıfları.'}, {'query': 'Transaction Log Durumu', 'note': 'log_reuse_wait açıklaması.'}, {'query': 'Log Backup Geçmişi', 'note': 'Son log backup zamanı.'}, {'query': "Uzun Süren Transaction'lar", 'note': 'ACTIVE_TRANSACTION ise.'}, {'query': 'Açık Transaction ile Sleeping Session', 'note': 'Idle tran tutan oturum.'}, {'query': 'VLF (Virtual Log File) Sayısı', 'note': 'Aşırı VLF var mı?'}, {'query': 'Autogrowth Olayları (Default Trace)', 'note': 'Log growth frekansı.'}],
+    },
+    {
+        'id': 'index',
+        'title': 'Index bakımı / yazma yavaşlığı',
+        'symptoms': 'INSERT/UPDATE yavaş, çok index, fragmentation şikayeti.',
+        'goal': 'Kullanılmayan/yinelenen/eksik index ve heap sorunlarını ayıklamak.',
+        'steps': [{'query': 'Kullanılmayan Indexler', 'note': 'Okunmayan index adayları.'}, {'query': 'Yinelenen / Çakışan Indexler', 'note': "Aynı key'ler."}, {'query': 'Index Kullanım İstatistikleri', 'note': 'Seek/scan/update dengesi.'}, {'query': 'Eksik Indexler (Öneriler)', 'note': 'Okuma tarafı önerileri.'}, {'query': 'Foreign Key Index Eksikleri', 'note': 'FK destek index.'}, {'query': 'Fragmente Indexler', 'note': 'Bakım adayları.'}, {'query': 'Heap Tablolar ve Forwarded Record', 'note': 'Heap maliyeti.'}],
+    },
+    {
+        'id': 'security',
+        'title': 'Güvenlik / yetki gözden geçirme',
+        'symptoms': 'Audit, excess privilege, login failed, orphan user.',
+        'goal': 'Yüksek yetki, zayıf parola politikası ve orphan hesapları bulmak.',
+        'steps': [{'query': 'Sysadmin ve Yüksek Yetkili Loginler', 'note': 'Kritik roller.'}, {'query': 'Zayıf Login Politikaları', 'note': 'Policy/expiration kapalı.'}, {'query': 'Server Level İzinler', 'note': 'Server permission şişmesi.'}, {'query': 'Database Level İzinler', 'note': 'db_owner vb.'}, {'query': 'Orphaned Database Users', 'note': 'Login map kopukları.'}, {'query': 'Başarısız Login Ring Buffer', 'note': 'Login failed izleri.'}, {'query': 'Sertifika ve Key Son Kullanım Tarihleri', 'note': 'Cert expiry.'}],
+    },
+    {
+        'id': 'ag',
+        'title': 'Always On / HA gecikmesi',
+        'symptoms': 'Secondary geride, failover endişesi, listener bağlantı sorunu.',
+        'goal': 'AG sağlık, lag ve listener/endpoint durumunu doğrulamak.',
+        'steps': [{'query': 'Availability Groups Durumu', 'note': 'Genel sağlık.'}, {'query': 'AG Senkronizasyon Gecikmesi', 'note': 'Redo/log send kuyruğu.'}, {'query': 'Availability Replicas', 'note': 'Role/bağlantı.'}, {'query': 'AG Listener ve Endpoint Durumu', 'note': 'Listener/endpoint.'}, {'query': 'Disk I/O İstatistikleri', 'note': 'Secondary I/O darboğazı?'}],
+    },
+    {
+        'id': 'agent',
+        'title': 'SQL Agent job sorunları',
+        'symptoms': 'Job fail, çalışmıyor, bildirim gelmiyor.',
+        'goal': "Fail eden, takılan veya schedule kaçıran job'ları bulmak.",
+        'steps': [{'query': 'SQL Agent Job Durumları', 'note': 'Enabled/son durum.'}, {'query': "Başarısız Job'lar", 'note': "Yakın fail'ler."}, {'query': 'Job Başarı Oranı (Son 7 Gün)', 'note': 'Kronik flaky.'}, {'query': "Uzun Süredir Çalışmayan Job'lar", 'note': 'Missed schedule.'}, {'query': "Çalışan Job'lar", 'note': 'Şu an takılı mı?'}, {'query': 'Database Mail Queue', 'note': 'Alert mail kuyruğu.'}],
+    },
+    {
+        'id': 'errors',
+        'title': 'Hata artışı / bağlantı kopmaları',
+        'symptoms': 'Uygulama hata logları, disconnect, severity yüksek exception.',
+        'goal': 'Ring buffer üzerinden hata sınıfını ve bağlantı sorununu ayırmak.',
+        'steps': [{'query': 'SQL Server Hataları (Son 24 Saat)', 'note': "Son exception'lar."}, {'query': 'Ring Buffer Exception Özeti', 'note': 'Code/severity tekrarları.'}, {'query': 'Ring Buffer Connectivity Hataları', 'note': 'Disconnect/handshake.'}, {'query': 'Başarısız Login Ring Buffer', 'note': 'Login failed.'}, {'query': 'Suspect Pages (Bozuk Sayfa)', 'note': 'Corruption sinyali.'}, {'query': 'Veritabanı Durumları', 'note': 'ONLINE dışı DB.'}],
+    },
+    {
+        'id': 'capacity',
+        'title': 'Disk doluyor / kapasite planı',
+        'symptoms': 'Disk uyarısı, autogrowth, hangi DB/tablo şişiyor belirsiz.',
+        'goal': 'DB/dosya/tablo büyümesini ve growth riskini bulmak.',
+        'steps': [{'query': 'Veritabanı Boyutları', 'note': 'Hangi DB büyük?'}, {'query': 'Dosya Alanı ve Büyüme Riski', 'note': 'Max size / growth riski.'}, {'query': 'Tablo Boyutları ve Satır Sayıları', 'note': 'Şişen nesneler.'}, {'query': 'Veritabanı Dosya Bilgileri', 'note': 'Data vs log.'}, {'query': 'Autogrowth Olayları (Default Trace)', 'note': 'Sık growth var mı?'}, {'query': 'Identity Kapasiteye Yaklaşan Kolonlar', 'note': 'Overflow riski.'}],
+    },
+]
+
+
+def get_query_guide(name: str) -> dict:
+    """Sorgu rehberini döndür; yoksa boş iskelet."""
+    guide = QUERY_GUIDES.get(name)
+    if guide:
+        return guide
+    return {
+        "summary": "",
+        "when": "",
+        "helps_with": [],
+        "before": [],
+        "after": [],
+        "interpret": "",
+        "tip": "",
+    }
+
+
+def get_situation_playbooks() -> List[dict]:
+    return list(SITUATION_PLAYBOOKS)
+
+
+def get_situation_by_id(situation_id: str) -> Optional[dict]:
+    for item in SITUATION_PLAYBOOKS:
+        if item.get("id") == situation_id:
+            return item
+    return None
+
+
+def format_guide_html(name: str, guide: Optional[dict] = None, situation: Optional[dict] = None) -> str:
+    """UI QTextBrowser için HTML rehber metni üret."""
+    guide = guide or get_query_guide(name)
+    parts = [f"<h3 style='margin:0 0 6px 0;'>{_html(name)}</h3>"]
+    if situation:
+        parts.append(
+            "<p style='margin:0 0 8px 0;'><b>Durum playbook:</b> "
+            f"{_html(situation.get('title', ''))}</p>"
+        )
+    if guide.get("summary"):
+        parts.append(f"<p style='margin:4px 0;'><b>Özet:</b> {_html(guide['summary'])}</p>")
+    if guide.get("when"):
+        parts.append(f"<p style='margin:4px 0;'><b>Ne zaman kullanılmalı:</b> {_html(guide['when'])}</p>")
+    helps = guide.get("helps_with") or []
+    if helps:
+        items = "".join(f"<li>{_html(x)}</li>" for x in helps)
+        parts.append(f"<p style='margin:4px 0;'><b>Hangi durumlara fayda eder:</b></p><ul style='margin:0 0 6px 18px;'>{items}</ul>")
+    before = [x for x in (guide.get("before") or []) if x]
+    after = [x for x in (guide.get("after") or []) if x]
+    if before:
+        links = " · ".join(_query_link(x) for x in before)
+        parts.append(f"<p style='margin:4px 0;'><b>Önce çalıştır (teyit/hazırlık):</b> {links}</p>")
+    if after:
+        links = " · ".join(_query_link(x) for x in after)
+        parts.append(f"<p style='margin:4px 0;'><b>Sonra çalıştır (doğrulama/derinleşme):</b> {links}</p>")
+    if guide.get("interpret"):
+        parts.append(f"<p style='margin:4px 0;'><b>Sonucu nasıl okumalı:</b> {_html(guide['interpret'])}</p>")
+    if guide.get("tip"):
+        parts.append(f"<p style='margin:4px 0;'><b>Yönlendirme:</b> {_html(guide['tip'])}</p>")
+    related_symptoms = get_symptoms_for_query(name)
+    if related_symptoms:
+        links = " · ".join(
+            f"<a href=\"symptom:{_html(item['id'])}\">{_html(item['title'])}</a>"
+            for item in related_symptoms
+        )
+        parts.append(
+            f"<p style='margin:4px 0;'><b>İlişkili SQL belirtileri:</b> {links}</p>"
+        )
+    return "".join(parts)
+
+
+def format_situation_html(situation: dict) -> str:
+    """Durum playbook özet HTML."""
+    steps = situation.get("steps") or []
+    items = []
+    for idx, step in enumerate(steps, 1):
+        q = step.get("query", "")
+        note = step.get("note", "")
+        items.append(
+            f"<li style='margin-bottom:4px;'><b>Adım {idx}:</b> {_query_link(q)}"
+            f"<br/><span style='color:#334155;'>{_html(note)}</span></li>"
+        )
+    return (
+        f"<h3 style='margin:0 0 6px 0;'>{_html(situation.get('title', ''))}</h3>"
+        f"<p style='margin:4px 0;'><b>Belirtiler (özet):</b> {_html(situation.get('symptoms', ''))}</p>"
+        f"<p style='margin:4px 0;color:#334155;'><b>İpucu:</b> Daha net SQL sinyali görüyorsanız "
+        "üstteki <i>SQL belirtisi</i> listesinden seçin (LCK_M_*, PAGEIOLATCH, PLE, LOG_BACKUP vb.).</p>"
+        f"<p style='margin:4px 0;'><b>Hedef:</b> {_html(situation.get('goal', ''))}</p>"
+        f"<p style='margin:4px 0;'><b>Önerilen sıra ({len(steps)} sorgu):</b></p>"
+        f"<ol style='margin:0 0 6px 18px;'>{"".join(items)}</ol>"
+        "<p style='margin:4px 0;color:#475569;'>Listedeki sorgu adına tıklayarak yükleyebilirsiniz. "
+        "Her adımın kendi önce/sonra teyit zinciri de rehber panelinde görünür.</p>"
+    )
+
+
+def _html(value: str) -> str:
+    return (
+        (value or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _query_link(name: str) -> str:
+    return f'<a href="query:{_html(name)}">{_html(name)}</a>'
+
+
+
+
+SQL_SYMPTOMS: List[dict] = [{'id': 'blocked_requests', 'title': 'blocked_requests > 0 / oturumlar birbirini bekliyor', 'category': 'Kilit / Blocking', 'signals': ['Sunucu Anlık Durum Kartı: blocked_requests > 0', 'Activity Monitor: Blocked By dolu', 'Uygulama timeout / donma'], 'what_you_see': "İşlemler sıraya girer, aynı kaynakta bekleyen session'lar artar, kullanıcı timeout görür.", 'queries': ['Sunucu Anlık Durum Kartı', 'Bekleyen İşlemler (Blocking)', 'Bekleme Zincirleri (Wait Chains)', "Bloke'ye Sebep Olan Sorgular", 'Açık Transaction ile Sleeping Session', 'Aktif Lock ve Wait Detayı'], 'situation_id': 'blocking'}, {'id': 'lck_wait', 'title': 'LCK_M_* wait tipi yüksek', 'category': 'Kilit / Blocking', 'signals': ['sys.dm_os_wait_stats: LCK_M_S / LCK_M_X / LCK_M_IX', 'Aktif İşlemler.wait_type LCK_*'], 'what_you_see': "Wait statistics veya aktif request'lerde kilit wait'leri üst sıradadır.", 'queries': ['Wait Statistics (Bekleme İstatistikleri)', 'Bekleyen İşlemler (Blocking)', 'Lock Bilgileri', 'Aktif Lock ve Wait Detayı', "Bloke'ye Sebep Olan Sorgular", 'Deadlock Bilgileri (Son 24 Saat)'], 'situation_id': 'blocking'}, {'id': 'idle_open_tran', 'title': 'Sleeping session + open_transaction_count > 0', 'category': 'Kilit / Blocking', 'signals': ['dm_exec_sessions: status=sleeping ve open_transaction_count>0', 'log_reuse_wait = ACTIVE_TRANSACTION'], 'what_you_see': "Görünürde çalışan sorgu yok ama kilit/log tutuluyor; SSMS'de unutulmuş BEGIN TRAN klasik örnektir.", 'queries': ['Açık Transaction ile Sleeping Session', "Uzun Süren Transaction'lar", 'Açık Transaction ve Log Kullanımı', 'Transaction Log Durumu', 'Bekleyen İşlemler (Blocking)'], 'situation_id': 'blocking'}, {'id': 'deadlock_1205', 'title': 'Deadlock / error 1205 artışı', 'category': 'Kilit / Blocking', 'signals': ['Uygulama log: Transaction was deadlocked', 'Extended Events deadlock_graph'], 'what_you_see': 'İşlemler rastgele geri alınıyor, retry sayısı artıyor.', 'queries': ['Deadlock Bilgileri (Son 24 Saat)', 'Bekleyen İşlemler (Blocking)', 'Foreign Key Index Eksikleri', 'Index Kullanım İstatistikleri', 'Aktif Lock ve Wait Detayı'], 'situation_id': 'blocking'}, {'id': 'high_cpu', 'title': 'CPU % yüksek / runnable queue', 'category': 'CPU / Paralellik', 'signals': ['OS CPU yüksek', 'dm_os_schedulers.runnable_tasks_count > 0', 'SOS_SCHEDULER_YIELD wait'], 'what_you_see': "Sunucu CPU doygun, sorgular CPU'da sıraya giriyor.", 'queries': ['Scheduler ve Runnable Task Yoğunluğu', 'En Çok CPU Kullanan Sorgular', 'Top CPU Kullanan Planlar', 'CXPACKET / CXCONSUMER Wait Özeti', 'Yüksek Compile / Recompile Oranı', 'Parameter Sniffing Adayları'], 'situation_id': 'cpu'}, {'id': 'cxpacket', 'title': 'CXPACKET / CXCONSUMER wait yüksek', 'category': 'CPU / Paralellik', 'signals': ['Wait stats: CXPACKET veya CXCONSUMER üstte', 'MAXDOP / Cost Threshold şüphesi'], 'what_you_see': "Paralel planlar CPU'yu paylaşıyor; bazı sorgular aşırı DOP kullanıyor olabilir.", 'queries': ['CXPACKET / CXCONSUMER Wait Özeti', 'Paralel Çalışan Sorgular', 'En Çok CPU Kullanan Sorgular', 'Varsayılan Olmayan Sunucu Ayarları', 'Scheduler ve Runnable Task Yoğunluğu'], 'situation_id': 'cpu'}, {'id': 'compile_storm', 'title': 'SQL Compilations/sec yüksek', 'category': 'CPU / Paralellik', 'signals': ['SQL Statistics: Compilations/sec ≈ Batch Requests/sec', 'Ad-hoc single-use plan oranı yüksek'], 'what_you_see': 'CPU plan üretmeye gidiyor; ad-hoc SQL veya sık recompile.', 'queries': ['Yüksek Compile / Recompile Oranı', 'Ad-hoc Plan Cache Şişmesi', 'Tek Kullanımlık Pahalı Planlar', 'Plan Cache İstatistikleri', 'Varsayılan Olmayan Sunucu Ayarları'], 'situation_id': 'cpu'}, {'id': 'pageiolatch', 'title': 'PAGEIOLATCH_* wait yüksek', 'category': 'Disk / I/O', 'signals': ['Wait stats: PAGEIOLATCH_SH/EX', 'Yüksek physical reads', 'PLE düşük eşlik edebilir'], 'what_you_see': 'Sorgular sayfa okumak için diski bekliyor.', 'queries': ['Wait Statistics (Bekleme İstatistikleri)', 'Read/Write Latency Analizi', 'Pending Disk I/O İstekleri', 'En Çok Physical Read Yapan Sorgular', 'Page Life Expectancy ve Buffer Hit', 'En Çok Logical Read Yapan Sorgular'], 'situation_id': 'io'}, {'id': 'writelog', 'title': 'WRITELOG wait / log yazma gecikmesi', 'category': 'Disk / I/O', 'signals': ['Wait stats: WRITELOG', 'Log dosyası latency yüksek'], 'what_you_see': "Commit'ler log I/O'da bekler; OLTP yavaşlar.", 'queries': ['Read/Write Latency Analizi', 'Transaction Log Durumu', 'Veritabanı Dosya Bilgileri', 'Pending Disk I/O İstekleri', 'Log Backup Geçmişi'], 'situation_id': 'io'}, {'id': 'high_latency', 'title': 'Dosya avg read/write latency yüksek', 'category': 'Disk / I/O', 'signals': ['dm_io_virtual_file_stats: avg latency > ~20ms (data), log daha hassas', 'Storage alert'], 'what_you_see': 'Belirli DB/dosya yavaş; autogrowth veya hotspot olabilir.', 'queries': ['Read/Write Latency Analizi', 'Pending Disk I/O İstekleri', 'Autogrowth Olayları (Default Trace)', 'TempDB Dosya Dengesizliği', 'Disk I/O İstatistikleri'], 'situation_id': 'io'}, {'id': 'low_ple', 'title': 'Page Life Expectancy düşük', 'category': 'Bellek', 'signals': ['Buffer Manager: Page life expectancy düşük/düşüyor', 'Buffer cache hit ratio düşüşü'], 'what_you_see': 'Cache sayfaları erken düşüyor; physical read artar.', 'queries': ['Page Life Expectancy ve Buffer Hit', 'Memory Grant Bekleyen Sorgular', 'En Çok Bellek Kullanan Sorgular', 'Sistem Bellek Detayları', 'En Çok Physical Read Yapan Sorgular', 'Ad-hoc Plan Cache Şişmesi'], 'situation_id': 'memory'}, {'id': 'resource_semaphore', 'title': 'RESOURCE_SEMAPHORE / memory grant pending', 'category': 'Bellek', 'signals': ['wait_type RESOURCE_SEMAPHORE', 'Memory Grants Pending > 0'], 'what_you_see': 'Sorgular bellek grant kuyruğunda; sort/hash için yer bekliyor.', 'queries': ['Memory Grant Bekleyen Sorgular', 'Page Life Expectancy ve Buffer Hit', 'En Çok Bellek Kullanan Sorgular', 'Aktif İşlemler', 'Yavaş Çalışan Sorgular'], 'situation_id': 'memory'}, {'id': 'plan_regression', 'title': 'Dün hızlı, bugün yavaş (plan regresyonu)', 'category': 'Sorgu / Plan', 'signals': ['Aynı SP/parametre seti süre sıçraması', 'Query Store plan değişimi'], 'what_you_see': 'Belirli sorgu aniden yavaşlar; genel sunucu sağlıklı olabilir.', 'queries': ['Query Store Durum Özeti', 'Query Store Plan Regresyonları', 'Query Store En Yavaş Sorgular', 'Parameter Sniffing Adayları', 'Statistics Güncellik Durumu', 'Eksik Indexler (Öneriler)'], 'situation_id': 'slow_query'}, {'id': 'param_sniffing', 'title': 'Aynı sorgu bazen çok yavaş (parameter sniffing)', 'category': 'Sorgu / Plan', 'signals': ['Aynı query_hash için yüksek süre/CPU varyansı', 'Farklı parametrelerle kararsız plan'], 'what_you_see': 'SP bazen 100ms bazen 30sn; parametreye duyarlı.', 'queries': ['Parameter Sniffing Adayları', 'Query Store Plan Regresyonları', 'Statistics Güncellik Durumu', 'Yavaş Çalışan Sorgular', 'Top CPU Kullanan Planlar'], 'situation_id': 'slow_query'}, {'id': 'high_logical_reads', 'title': 'Logical read çok yüksek / ağır scan', 'category': 'Sorgu / Plan', 'signals': ['dm_exec_query_stats: total_logical_reads liderleri', 'Eksik index önerileri'], 'what_you_see': 'CPU veya I/O yükseliyor; sorgular çok sayfa okuyor.', 'queries': ['En Çok Logical Read Yapan Sorgular', 'Eksik Indexler (Öneriler)', 'Yavaş Çalışan Sorgular', 'Index Kullanım İstatistikleri', 'Foreign Key Index Eksikleri'], 'situation_id': 'slow_query'}, {'id': 'tempdb_full', 'title': 'TempDB doluyor / alan uyarısı', 'category': 'TempDB', 'signals': ['TempDB disk doluluk', 'Hata: 1101/1105 tempdb'], 'what_you_see': "Geçici nesne, version store veya spill TempDB'yi şişiriyor.", 'queries': ['TempDB Kullanımı', 'Açık Transaction ve Log Kullanımı', 'Aktif İşlemler', 'TempDB Dosya Dengesizliği', "Uzun Süren Transaction'lar"], 'situation_id': 'tempdb'}, {'id': 'tempdb_pagelatch', 'title': 'TempDB PAGELATCH contention', 'category': 'TempDB', 'signals': ['PAGELATCH_UP/EX on TempDB', 'Allocation bottleneck'], 'what_you_see': 'Çok sayıda eşzamanlı temp table/#table yaratımı yavaşlıyor.', 'queries': ['Tempdb Contention Analizi', 'TempDB Dosya Dengesizliği', 'Latch Contention Top', 'TempDB Kullanımı', 'Aktif İşlemler'], 'situation_id': 'tempdb'}, {'id': 'log_reuse_active_tran', 'title': 'log_reuse_wait = ACTIVE_TRANSACTION', 'category': 'Log / Yedek', 'signals': ['Transaction Log Durumu: ACTIVE_TRANSACTION', 'Log dosyası büyümeye devam'], 'what_you_see': 'Log truncate olamıyor çünkü açık transaction var.', 'queries': ['Transaction Log Durumu', "Uzun Süren Transaction'lar", 'Açık Transaction ile Sleeping Session', 'Açık Transaction ve Log Kullanımı', 'Bekleyen İşlemler (Blocking)'], 'situation_id': 'log_rpo'}, {'id': 'log_reuse_log_backup', 'title': 'log_reuse_wait = LOG_BACKUP', 'category': 'Log / Yedek', 'signals': ['FULL/BULK_LOGGED + log backup gecikmiş/yok', 'RPO Riski: Log backup yok/gecikmeli'], 'what_you_see': 'Log şişer; point-in-time restore riski artar.', 'queries': ['RPO Riski - Backup Gecikmeleri', 'Log Backup Geçmişi', 'Transaction Log Durumu', 'SQL Agent Job Durumları', 'VLF (Virtual Log File) Sayısı'], 'situation_id': 'log_rpo'}, {'id': 'too_many_vlfs', 'title': 'Aşırı VLF sayısı', 'category': 'Log / Yedek', 'signals': ['sys.dm_db_log_info: yüzlerce/binlerce VLF', 'Yavaş recovery / uzun crash recovery'], 'what_you_see': 'Log operasyonları ve recovery uzar; sık küçük autogrowth geçmişi tipiktir.', 'queries': ['VLF (Virtual Log File) Sayısı', 'Autogrowth Olayları (Default Trace)', 'Transaction Log Durumu', 'Veritabanı Dosya Büyüme Durumu', 'Dosya Alanı ve Büyüme Riski'], 'situation_id': 'log_rpo'}, {'id': 'backup_overdue', 'title': 'Full/log backup gecikmiş veya yok', 'category': 'Log / Yedek', 'signals': ['RPO Riski sınıfları', 'msdb backupset boş/eski'], 'what_you_see': 'Yedek SLA bozulmuş; disaster recovery güvencesi zayıf.', 'queries': ['RPO Riski - Backup Gecikmeleri', 'Veritabanı Backup Durumu', 'Full Backup Geçmişi', 'Log Backup Geçmişi', 'Differential Backup Geçmişi', "Başarısız Job'lar"], 'situation_id': 'log_rpo'}, {'id': 'unused_indexes', 'title': 'Yazma yavaş / gereksiz index şüphesi', 'category': 'Index / Schema', 'signals': ['INSERT/UPDATE yavaş', 'Çok sayıda az kullanılan index'], 'what_you_see': 'OLTP yazma maliyeti yüksek; index bakımı uzun sürüyor.', 'queries': ['Kullanılmayan Indexler', 'Yinelenen / Çakışan Indexler', 'Index Kullanım İstatistikleri', 'Fragmente Indexler', 'Foreign Key Index Eksikleri'], 'situation_id': 'index'}, {'id': 'forwarded_records', 'title': 'Heap + forwarded record', 'category': 'Index / Schema', 'signals': ['dm_db_index_physical_stats: forwarded_record_count > 0', 'Heap tabloda ağır update/okuma'], 'what_you_see': 'Heap tablolarda ekstra I/O; scan maliyeti artar.', 'queries': ['Heap Tablolar ve Forwarded Record', 'Primary Key Olmayan Tablolar', 'En Çok Logical Read Yapan Sorgular', 'Fragmente Indexler'], 'situation_id': 'index'}, {'id': 'sysadmin_excess', 'title': 'sysadmin / excess privilege', 'category': 'Güvenlik', 'signals': ['Uygulama hesabı sysadmin', 'Audit bulgusu'], 'what_you_see': 'Least privilege ihlali; risk yüzeyi geniş.', 'queries': ['Sysadmin ve Yüksek Yetkili Loginler', 'Server Level İzinler', 'Database Level İzinler', 'Zayıf Login Politikaları', 'Linked Server Envanteri'], 'situation_id': 'security'}, {'id': 'login_failed', 'title': 'Login failed / authentication hataları', 'category': 'Güvenlik', 'signals': ['Error 18456', 'Uygulama bağlanamıyor', 'Ring buffer exception tekrarları'], 'what_you_see': 'Başarısız oturum açma artışı; orphan user veya parola/policy sorunu olabilir.', 'queries': ['Başarısız Login Ring Buffer', 'SQL Server Hataları (Son 24 Saat)', 'Orphaned Database Users', 'Zayıf Login Politikaları', 'Ring Buffer Connectivity Hataları'], 'situation_id': 'security'}, {'id': 'ag_lag', 'title': 'AG redo/log send queue büyüyor', 'category': 'HA / Always On', 'signals': ['dm_hadr_database_replica_states: redo_queue_size / log_send_queue_size yüksek', 'Secondary geride'], 'what_you_see': 'Rapor/DR secondary gecikmeli; failover RPO/RTO riski.', 'queries': ['Availability Groups Durumu', 'AG Senkronizasyon Gecikmesi', 'Availability Replicas', 'Disk I/O İstatistikleri', 'AG Listener ve Endpoint Durumu'], 'situation_id': 'ag'}, {'id': 'ag_listener', 'title': 'AG listener / endpoint bağlantı sorunu', 'category': 'HA / Always On', 'signals': ["Uygulama listener'a bağlanamıyor", 'Endpoint state sorunlu'], 'what_you_see': "Bağlantı string listener DNS/port'ta takılır.", 'queries': ['AG Listener ve Endpoint Durumu', 'Availability Groups Durumu', 'Availability Replicas', 'Sertifika ve Key Son Kullanım Tarihleri', 'Ring Buffer Connectivity Hataları'], 'situation_id': 'ag'}, {'id': 'job_failed', 'title': 'SQL Agent job fail / çalışmıyor', 'category': 'Agent / Operasyon', 'signals': ['Job history run_status = 0', 'Enabled job 7+ gündür çalışmamış', 'Backup/ETL job kırmızı'], 'what_you_see': 'Gece işleri kırık; mail gelmiyor olabilir.', 'queries': ["Başarısız Job'lar", 'Job Başarı Oranı (Son 7 Gün)', 'SQL Agent Job Durumları', "Uzun Süredir Çalışmayan Job'lar", "Çalışan Job'lar", 'Database Mail Queue'], 'situation_id': 'agent'}, {'id': 'exception_spike', 'title': 'Exception / severity yüksek hata artışı', 'category': 'Hata / Connectivity', 'signals': ['Ring buffer exception yoğunluğu', 'Uygulama hata log spike'], 'what_you_see': 'Ani hata frekansı; connectivity veya corruption sinyali eşlik edebilir.', 'queries': ['SQL Server Hataları (Son 24 Saat)', 'Ring Buffer Exception Özeti', 'Ring Buffer Connectivity Hataları', 'Suspect Pages (Bozuk Sayfa)', 'Veritabanı Durumları'], 'situation_id': 'errors'}, {'id': 'suspect_pages', 'title': '823/824 / suspect_pages kaydı', 'category': 'Hata / Connectivity', 'signals': ['msdb.dbo.suspect_pages dolu', 'I/O error 823/824'], 'what_you_see': 'Olası sayfa bozulması; storage/DBCC hattına geçilmeli (bu araç DBCC çalıştırmaz).', 'queries': ['Suspect Pages (Bozuk Sayfa)', 'Veritabanı Durumları', 'Ring Buffer Exception Özeti', 'Read/Write Latency Analizi', 'Veritabanı Backup Durumu'], 'situation_id': 'errors'}, {'id': 'autogrowth_storm', 'title': 'Sık autogrowth / ani latency spike', 'category': 'Kapasite', 'signals': ['Default trace: Data/Log File Auto Grow', 'Latency spike growth zamanıyla çakışıyor'], 'what_you_see': 'Dosya büyürken kısa süreli donmalar.', 'queries': ['Autogrowth Olayları (Default Trace)', 'Dosya Alanı ve Büyüme Riski', 'Veritabanı Dosya Büyüme Durumu', 'Read/Write Latency Analizi', 'Veritabanı Boyutları'], 'situation_id': 'capacity'}, {'id': 'disk_full', 'title': 'Disk doluyor / hangi DB şişiyor belirsiz', 'category': 'Kapasite', 'signals': ['OS disk uyarısı', 'DB boyut sıçraması'], 'what_you_see': 'Kapasite alarmı; data mı log mı, hangi tablo şişiyor bilinmiyor.', 'queries': ['Veritabanı Boyutları', 'Dosya Alanı ve Büyüme Riski', 'Tablo Boyutları ve Satır Sayıları', 'Veritabanı Dosya Bilgileri', 'Transaction Log Durumu', 'Identity Kapasiteye Yaklaşan Kolonlar'], 'situation_id': 'capacity'}, {'id': 'connection_leak', 'title': 'Bağlantı sızıntısı / pool şişmesi', 'category': 'Bağlantı', 'signals': ['Sleeping session sayısı anormal yüksek', 'Uygulama pool exhaustion'], 'what_you_see': 'Session count artar, çoğu sleeping; uygulama bağlantıyı bırakmıyor olabilir.', 'queries': ['Uygulama Bazlı Bağlantı Dağılımı', 'Idle Session ve Sleeping Connections', 'Connection Pool İstatistikleri', 'Uzun Süreli Bağlantılar', 'Aktif Bağlantılar', 'Açık Transaction ile Sleeping Session'], 'situation_id': 'triage'}, {'id': 'unknown_slowness', 'title': 'Genel yavaşlık — sınıf belirsiz', 'category': 'Triage', 'signals': ['Kullanıcı şikayeti', 'Net wait/CPU/IO ayrımı yok'], 'what_you_see': 'Her şey biraz yavaş; önce sınıflandırma gerekir.', 'queries': ['Sunucu Anlık Durum Kartı', 'Wait Statistics (Bekleme İstatistikleri)', 'Aktif İşlemler', 'Scheduler ve Runnable Task Yoğunluğu', 'Page Life Expectancy ve Buffer Hit', 'Yavaş Çalışan Sorgular'], 'situation_id': 'triage'}]
+
+
+def get_sql_symptoms() -> List[dict]:
+    return list(SQL_SYMPTOMS)
+
+
+def get_symptom_by_id(symptom_id: str) -> Optional[dict]:
+    for item in SQL_SYMPTOMS:
+        if item.get("id") == symptom_id:
+            return item
+    return None
+
+
+def get_symptoms_for_query(query_name: str) -> List[dict]:
+    """Bir sorgunun ilişkili SQL belirtilerini döndür."""
+    related = []
+    for item in SQL_SYMPTOMS:
+        if query_name in (item.get("queries") or []):
+            related.append(item)
+    return related
+
+
+def format_symptom_html(symptom: dict) -> str:
+    """Belirti seçildiğinde gösterilecek HTML."""
+    signals = symptom.get("signals") or []
+    signal_items = "".join(f"<li>{_html(x)}</li>" for x in signals)
+    steps = symptom.get("queries") or []
+    step_items = []
+    for idx, q in enumerate(steps, 1):
+        step_items.append(
+            f"<li style='margin-bottom:4px;'><b>Script {idx}:</b> {_query_link(q)}</li>"
+        )
+    situation = get_situation_by_id(symptom.get("situation_id") or "")
+    situation_line = ""
+    if situation:
+        situation_line = (
+            "<p style='margin:4px 0;'><b>İlgili durum playbook:</b> "
+            f"{_html(situation.get('title', ''))}</p>"
+        )
+    return (
+        f"<h3 style='margin:0 0 6px 0;'>Belirti: {_html(symptom.get('title', ''))}</h3>"
+        f"<p style='margin:4px 0;'><b>Kategori:</b> {_html(symptom.get('category', ''))}</p>"
+        f"<p style='margin:4px 0;'><b>SQL sunucuda ne görürsünüz:</b> {_html(symptom.get('what_you_see', ''))}</p>"
+        f"<p style='margin:4px 0;'><b>Teknik sinyaller:</b></p>"
+        f"<ul style='margin:0 0 6px 18px;'>{signal_items}</ul>"
+        f"{situation_line}"
+        f"<p style='margin:4px 0;'><b>Bu belirti için çalıştırılacak scriptler ({len(steps)}):</b></p>"
+        f"<ol style='margin:0 0 6px 18px;'>{''.join(step_items)}</ol>"
+        "<p style='margin:4px 0;color:#475569;'>Script adına tıklayarak yükleyin. "
+        "Her scriptin kendi önce/sonra teyit zinciri de rehberde görünür.</p>"
+    )
+
+
+def search_symptoms(term: str) -> List[dict]:
+    term_lower = (term or "").strip().lower()
+    results = []
+    for item in SQL_SYMPTOMS:
+        blob = " ".join(
+            [
+                item.get("title", ""),
+                item.get("category", ""),
+                item.get("what_you_see", ""),
+                " ".join(item.get("signals") or []),
+                " ".join(item.get("queries") or []),
+            ]
+        ).lower()
+        if not term_lower or term_lower in blob:
+            results.append(item)
+    return results
+
+
+def search_guides(term: str) -> List[str]:
+    """Ada, özete, when/helps alanlarına göre sorgu ara."""
+    term_lower = (term or "").strip().lower()
+    results = []
+    for name, guide in QUERY_GUIDES.items():
+        blob = " ".join(
+            [
+                name,
+                guide.get("summary", ""),
+                guide.get("when", ""),
+                guide.get("interpret", ""),
+                guide.get("tip", ""),
+                " ".join(guide.get("helps_with") or []),
+            ]
+        ).lower()
+        if not term_lower or term_lower in blob:
+            results.append(name)
+    return sorted(results)
+

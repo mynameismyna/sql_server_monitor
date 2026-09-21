@@ -2,15 +2,19 @@
 
 ## Genel Uyumluluk
 
-Çoğu sorgu **SQL Server 2008 ve üzeri** versiyonlarda çalışır. VLF sorgusu ve bazı özellik sorguları daha yeni sürüm veya ek bileşen gerektirir.
+Çoğu sorgu **SQL Server 2008 ve üzeri** versiyonlarda çalışır. VLF, Query Store, Always On derin izleme, database scoped configuration, temporal/In-Memory ve bazı ring buffer sorguları daha yeni sürüm veya ek bileşen gerektirir.
+
+Gelişmiş katalogda **120 hazır diagnostik sorgu** ve **22 kategori** vardır. Özellik yüklü değilse ilgili sorgu hata verebilir; bu beklenen bir durumdur.
 
 ## Gerekli İzinler
 
 Çoğu sunucu tanılama sorgusu için **VIEW SERVER STATE** izni gerekir. Yalnızca sorgu çalıştırmak amacıyla `sysadmin` rolü verilmemelidir. Bazı sorgular için ek izinler:
 
-- **msdb** veritabanı sorguları: `msdb` veritabanına erişim
+- **msdb** veritabanı sorguları: `msdb` veritabanına erişim (backup, Agent, suspect_pages, Database Mail)
 - **distribution** veritabanı sorguları: Replication yapılandırması gerektirir
 - **Güvenlik sorguları**: Server ve database seviyesinde izin görüntüleme yetkisi
+- **Default Trace / Autogrowth**: Default trace açık olmalı; `fn_trace_gettable` erişimi gerekir
+- **Index fiziksel istatistikleri**: İlgili veritabanında `VIEW DATABASE STATE` yararlıdır
 
 ## Özellik Bazlı Sorgular
 
@@ -19,6 +23,8 @@
 - **Sorgular**: 
   - Availability Groups Durumu
   - Availability Replicas
+  - AG Senkronizasyon Gecikmesi
+  - AG Listener ve Endpoint Durumu
 - **Not**: Bu özellik yoksa sorgu hata verecektir
 
 ### Replication
@@ -34,12 +40,24 @@
   - SQL Agent Job Durumları
   - Başarısız Job'lar
   - Çalışan Job'lar
+  - Job Başarı Oranı (Son 7 Gün)
+  - Uzun Süredir Çalışmayan Job'lar
 - **Not**: Agent servisi kapalıysa veya `msdb` erişimi yoksa sorgu hata verecektir
 
 ### VLF (Virtual Log File)
 - **Gereksinim**: SQL Server 2016 SP2 veya üzeri
 - **Sorgu**: VLF (Virtual Log File) Sayısı
 - **Not**: `sys.dm_db_log_info` fonksiyonu ve ilgili performans durumu izni gereklidir
+
+### Query Store / Temporal / In-Memory
+- **Query Store Durum Özeti**: SQL Server 2016+ ve Query Store açık olmalı
+- **Temporal Tablo Envanteri**: Temporal table içeren veritabanları
+- **In-Memory OLTP Kullanımı**: Memory-optimized table içeren instance
+
+### Ring Buffer Hata Sorguları
+- **SQL Server Hataları (Son 24 Saat)** ve ring buffer sorguları `xp_readerrorlog` kullanmaz
+- Exception / connectivity / scheduler monitor ring buffer kayıtlarına dayanır
+- Ring buffer içeriği instance yeniden başladıktan sonra sıfırlanabilir
 
 ## Versiyon Uyumluluğu
 
@@ -56,6 +74,7 @@
 
 ### SQL Server 2016+
 - Temel sorgular çalışır; VLF sorgusu için SQL Server 2016 SP2 veya üzeri gerekir
+- Query Store ve birçok gelişmiş diagnostik kullanılabilir
 - Özellik sorguları yalnızca ilgili bileşen yapılandırılmışsa çalışır
 
 ## Read-only Çalışma
@@ -77,10 +96,11 @@ Sorgu çalıştırıldığında hata alırsanız:
 
 ## Öneriler
 
-1. **Temel sorgularla başlayın**: Aktif Bağlantılar, Veritabanı Boyutları gibi
+1. **Sağlık özeti ile başlayın**: `Sunucu Anlık Durum Kartı`, `Page Life Expectancy ve Buffer Hit`
 2. **İzinleri kontrol edin**: VIEW SERVER STATE izni olup olmadığını kontrol edin
 3. **Versiyonu öğrenin**: `SELECT @@VERSION` ile SQL Server versiyonunu öğrenin
-4. **Özellikleri kontrol edin**: Always On, Replication gibi özelliklerin yüklü olup olmadığını kontrol edin
+4. **Arama kutusunu kullanın**: `blocking`, `backup`, `index`, `ag` gibi anahtar kelimelerle filtreleyin
+5. **Özellikleri kontrol edin**: Always On, Replication gibi özelliklerin yüklü olup olmadığını kontrol edin
 
 ## Alternatif Çözümler
 
@@ -89,4 +109,4 @@ Bazı sorgular çalışmazsa, benzer bilgileri almak için alternatif sorgular k
 - Always On yoksa: Normal backup/restore durumunu kontrol edin
 - Replication yoksa: Log shipping durumunu kontrol edin
 - Agent yoksa: Manuel backup durumunu kontrol edin
-
+- Error log prosedürü yoksa: Ring buffer exception sorgularını kullanın
