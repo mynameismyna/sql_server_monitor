@@ -1,22 +1,22 @@
 # SQL Sunucu Takip Uygulaması
 
-SQL Server üzerinde analiz yapmak, hataları takip etmek ve read-only sorgular çalıştırmak için geliştirilmiş masaüstü uygulaması.
+SQL Server üzerinde analiz yapmak, hataları takip etmek ve read-only sorgular çalıştırmak için geliştirilmiş masaüstü uygulaması. Gelişmiş sürüm **120 hazır diagnostik sorgu** ve **22 kategori** içerir.
 
 ## Özellikler
 
 - **SQL Server Bağlantı Yönetimi**: Windows Authentication ve SQL Server Authentication desteği
 - **Read-only SQL Sorguları**: Kendi yazdığınız `SELECT` ve CTE sorgularını güvenli varsayılanlarla çalıştırma
-- **Hazır Analiz Sorguları**: 
-  - Aktif bağlantılar
-  - Yavaş çalışan sorgular
-  - SQL Server hataları (son 24 saat)
-  - Veritabanı boyutları
-  - Bekleyen işlemler (blocking)
-  - En çok CPU kullanan sorgular
-  - Aktif işlemler
-  - Veritabanı dosya bilgileri
-  - Tablo satır sayıları
-- **Sorgu Sonuçları**: Sonuçları tablo formatında görüntüleme
+- **Gelişmiş Hazır Diagnostik Kataloğu (120 sorgu)**:
+  - Sunucu sağlık özeti (PLE, scheduler, memory grant, I/O)
+  - Performans derin analiz (plan cache, parameter sniffing, wait/latch)
+  - Index / schema sağlığı (yinelenen index, FK index eksikleri, heap, identity kapasitesi)
+  - Yedekleme ve RPO riski, suspect pages, autogrowth
+  - Güvenlik ve erişim (sysadmin, zayıf login politikası, orphaned users, sertifikalar)
+  - SQL Agent operasyon, Always On gecikme, TempDB dengesi, açık transaction
+  - Yapılandırma, Query Store, CDC/Change Tracking, Service Broker, In-Memory OLTP
+  - Ring buffer exception / connectivity / scheduler monitor
+- **Sorgu Arama**: Ada ve açıklamaya göre hızlı filtreleme
+- **Sorgu Sonuçları**: Sonuçları tablo formatında görüntüleme ve Excel’e aktarma
 - **Hata Yönetimi**: Detaylı hata mesajlarını görüntüleme
 - **Sonuç Sınırı**: Büyük sonuç kümelerini ilk 10.000 satırla sınırlandırma
 - **Eşzamanlı Çalışma Koruması**: Önceki sorgu tamamlanmadan yeni sorgu başlatmama
@@ -69,7 +69,7 @@ Uygulama açıldığında:
 ## Kullanım İpuçları
 
 - **F5 Tuşu**: Sorguyu hızlıca çalıştırmak için F5 tuşunu kullanabilirsiniz
-- **Hazır Sorgular**: Dropdown menüden hazır analiz sorgularını seçebilirsiniz
+- **Kategori + Arama**: Önce kategori seçin veya `blocking`, `backup`, `index` gibi anahtar kelimelerle arayın
 - **Otomatik Çalıştırma**: Yalnızca read-only sorgular otomatik çalıştırılabilir; önceki sorgu bitmeden yenisi başlamaz
 - **Sonuçlar**: Sorgu sonuçları otomatik olarak tablo formatında gösterilir
 - **Hatalar**: Herhangi bir hata durumunda detaylı mesajlar "Hata Mesajları" bölümünde görüntülenir
@@ -78,6 +78,9 @@ Uygulama açıldığında:
 
 - **Framework**: PyQt5 (Python GUI framework)
 - **Veritabanı Bağlantısı**: pyodbc (ODBC driver kullanarak)
+- **Sorgu Kataloğu**: `predefined_queries.py` + `advanced_queries.py`
+- **Güvenlik Katmanı**: `query_safety.py` (yalnızca SELECT/CTE)
+
 - **Veri İşleme**: pandas (sonuçları işlemek için)
 
 ## Notlar

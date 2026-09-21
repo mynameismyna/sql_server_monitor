@@ -14,7 +14,18 @@ import pandas as pd
 from datetime import datetime
 from sql_connection import QueryResult, SQLConnection
 from query_safety import validate_read_only_query
-from predefined_queries import PREDEFINED_QUERIES, get_all_queries, save_user_query, delete_user_query, load_user_queries, rename_user_query, get_user_query_categories
+from predefined_queries import (
+    PREDEFINED_QUERIES,
+    get_all_queries,
+    save_user_query,
+    delete_user_query,
+    load_user_queries,
+    rename_user_query,
+    get_user_query_categories,
+    get_query_description,
+    search_predefined_queries,
+    count_executable_queries,
+)
 from config_manager import ConfigManager
 
 
@@ -58,7 +69,7 @@ class SQLServerApp(QMainWindow):
     
     def init_ui(self):
         """Kullanıcı arayüzünü oluştur"""
-        self.setWindowTitle("SQL Sunucu Takip Uygulaması")
+        self.setWindowTitle("SQL Sunucu Takip — Gelişmiş Diagnostik")
         self.setGeometry(100, 100, 1400, 900)
         
         # Menü çubuğu oluştur
@@ -93,6 +104,10 @@ class SQLServerApp(QMainWindow):
         main_layout.addWidget(self.database_widget)
         
         # Hazır sorgular (bağlantıdan sonra görünecek, şimdilik gizli)
+        queries_outer = QVBoxLayout()
+        queries_outer.setContentsMargins(0, 0, 0, 0)
+        queries_outer.setSpacing(4)
+
         self.queries_layout = QHBoxLayout()
         
         # Kategori seçimi
@@ -105,9 +120,17 @@ class SQLServerApp(QMainWindow):
         # Sorgu seçimi
         self.queries_layout.addWidget(QLabel("Sorgu:"))
         self.predefined_combo = QComboBox()
+        self.predefined_combo.setEditable(False)
         self.predefined_combo.addItem("-- Sorgu seçin veya kendi sorgunuzu yazın --")
         self.predefined_combo.currentTextChanged.connect(self.on_predefined_query_selected)
         self.queries_layout.addWidget(self.predefined_combo, 1)
+
+        self.queries_layout.addWidget(QLabel("Ara:"))
+        self.query_search_input = QLineEdit()
+        self.query_search_input.setPlaceholderText("ör. blocking, backup, index...")
+        self.query_search_input.setMaximumWidth(220)
+        self.query_search_input.textChanged.connect(self.on_query_search_changed)
+        self.queries_layout.addWidget(self.query_search_input)
         
         # Butonlar
         self.add_query_btn = QPushButton("Sorguyu Kaydet")
@@ -119,9 +142,18 @@ class SQLServerApp(QMainWindow):
         self.manage_queries_btn.clicked.connect(self.manage_queries)
         self.manage_queries_btn.setEnabled(False)
         self.queries_layout.addWidget(self.manage_queries_btn)
+
+        queries_outer.addLayout(self.queries_layout)
+
+        self.query_info_label = QLabel(
+            f"{count_executable_queries()} hazır diagnostik sorgu · kategori seçin veya arama yapın"
+        )
+        self.query_info_label.setWordWrap(True)
+        self.query_info_label.setStyleSheet("color: #334155; padding: 2px 4px;")
+        queries_outer.addWidget(self.query_info_label)
         
         self.queries_widget = QWidget()
-        self.queries_widget.setLayout(self.queries_layout)
+        self.queries_widget.setLayout(queries_outer)
         self.queries_widget.setVisible(False)
         main_layout.addWidget(self.queries_widget)
         
@@ -362,10 +394,18 @@ class SQLServerApp(QMainWindow):
     
     def on_category_selected(self, category):
         """Kategori seçildiğinde sorgu listesini güncelle"""
+        # Arama kutusu doluysa arama sonucu öncelikli kalsın
+        if hasattr(self, "query_search_input") and self.query_search_input.text().strip():
+            self.on_query_search_changed(self.query_search_input.text())
+            return
+
         self.predefined_combo.clear()
         
         if not category or category.startswith("-- Kategori seçin"):
             self.predefined_combo.addItem("-- Sorgu seçin veya kendi sorgunuzu yazın --")
+            self.query_info_label.setText(
+                f"{count_executable_queries()} hazır diagnostik sorgu · kategori seçin veya arama yapın"
+            )
             return
         
         # Kategori adından sorgu sayısını kaldır
@@ -378,11 +418,38 @@ class SQLServerApp(QMainWindow):
             queries = sorted([q for q in all_queries.keys() if not q.startswith("===")])
             self.predefined_combo.addItem(f"-- {len(queries)} sorgu bulundu --")
             self.predefined_combo.addItems(queries)
+            self.query_info_label.setText(f"Tüm katalog: {len(queries)} sorgu")
         else:
             # Seçili kategorideki sorguları göster (sistem ve kullanıcı sorgularını birlikte)
             category_queries = sorted(self.get_queries_by_category(category_name, all_queries))
             self.predefined_combo.addItem(f"-- {len(category_queries)} sorgu bulundu --")
             self.predefined_combo.addItems(category_queries)
+            self.query_info_label.setText(f"{category_name}: {len(category_queries)} sorgu")
+
+    def on_query_search_changed(self, text):
+        """Ada/açıklamaya göre hazır sorgu listesini filtrele."""
+        term = (text or "").strip()
+        self.predefined_combo.blockSignals(True)
+        self.predefined_combo.clear()
+
+        if not term:
+            self.predefined_combo.blockSignals(False)
+            current_category = self.category_combo.currentText()
+            self.on_category_selected(current_category)
+            return
+
+        matches = search_predefined_queries(term)
+        # Kullanıcı sorgularını da ada göre ekle
+        user_queries = load_user_queries()
+        for name in user_queries:
+            if term.lower() in name.lower() and name not in matches:
+                matches.append(name)
+        matches = sorted(matches)
+
+        self.predefined_combo.addItem(f"-- {len(matches)} arama sonucu --")
+        self.predefined_combo.addItems(matches)
+        self.predefined_combo.blockSignals(False)
+        self.query_info_label.setText(f"Arama: '{term}' → {len(matches)} sonuç")
     
     def get_queries_by_category(self, category, all_queries):
         """Kategoriye göre sorguları filtrele"""
@@ -431,13 +498,21 @@ class SQLServerApp(QMainWindow):
                 
                 # Buton metnini "Sorguyu Düzenle" olarak değiştir
                 self.add_query_btn.setText("Sorguyu Düzenle")
+
+                description = get_query_description(text)
+                if description:
+                    self.query_info_label.setText(f"{text}: {description}")
+                else:
+                    self.query_info_label.setText(f"Seçili sorgu: {text}")
         else:
             # Boş seçim yapıldığında normal moda dön
             self.selected_query_name = None
             self.edit_mode = False
             self.query_editor.setReadOnly(False)
             self.add_query_btn.setText("Sorguyu Kaydet")
-    
+            self.query_info_label.setText(
+                f"{count_executable_queries()} hazır diagnostik sorgu · kategori seçin veya arama yapın"
+            ) 
     def select_category_dialog(self, title, message):
         """Kategori seçimi dialog'u"""
         dialog = QDialog(self)
