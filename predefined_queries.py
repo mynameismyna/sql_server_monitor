@@ -13,6 +13,7 @@ from query_guides import (
     get_situation_by_id,
     get_situation_playbooks,
     search_guides,
+    search_symptoms,
 )
 
 USER_QUERIES_FILE = "user_queries.json"
@@ -1469,12 +1470,15 @@ def get_query_description(name: str) -> str:
 
 
 def search_predefined_queries(term: str):
-    """Ada, açıklamaya veya rehber metnine göre hazır sorgu ara."""
+    """Ada, açıklamaya, rehbere veya SQL belirti metnine göre hazır sorgu ara."""
     term_lower = (term or "").strip().lower()
     if not term_lower:
         return sorted(name for name in PREDEFINED_QUERIES if not name.startswith("==="))
 
     guided = set(search_guides(term_lower))
+    for symptom in search_symptoms(term_lower):
+        guided.update(symptom.get("queries") or [])
+
     results = set()
     for name in PREDEFINED_QUERIES:
         if name.startswith("==="):

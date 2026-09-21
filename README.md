@@ -18,6 +18,7 @@ SQL Server üzerinde analiz yapmak, hataları takip etmek ve read-only sorgular 
 - **Sorgu Arama**: Ada, belirtiye ve rehber metnine göre hızlı filtreleme
 - **Sorgu Rehberi**: Her sorgu için ne zaman kullanılacağı, fayda ettiği durumlar, önce/sonra teyit sorguları ve sonuç yorumlama ipuçları
 - **Durum Playbook'ları**: Blocking, CPU, I/O, bellek, TempDB, RPO, güvenlik gibi yaşanan duruma göre önerilen sorgu sırası
+- **SQL Belirti Seçici**: `LCK_M_*`, `PAGEIOLATCH`, PLE düşük, `LOG_BACKUP`, AG lag gibi sunucu sinyallerine göre script listesi
 - **Sorgu Sonuçları**: Sonuçları tablo formatında görüntüleme ve Excel’e aktarma
 - **Hata Yönetimi**: Detaylı hata mesajlarını görüntüleme
 - **Sonuç Sınırı**: Büyük sonuç kümelerini ilk 10.000 satırla sınırlandırma
@@ -73,7 +74,8 @@ Uygulama açıldığında:
 - **F5 Tuşu**: Sorguyu hızlıca çalıştırmak için F5 tuşunu kullanabilirsiniz
 - **Kategori + Arama**: Önce kategori seçin veya `blocking`, `backup`, `PLE` gibi anahtar kelimelerle arayın
 - **Yaşadığım durum**: Belirtiye göre playbook seçin; önerilen sıradaki sorgulara tıklayarak ilerleyin
-- **Rehber paneli**: Seçili sorgunun ne zaman kullanılacağını, önce/sonra teyit zincirini ve yorum ipuçlarını gösterir
+- **SQL belirtisi**: Wait tipi / performans sayacı / operasyonel sinyali seçin; ilgili scriptler otomatik listelenir
+- **Rehber paneli**: Seçili sorgunun ne zaman kullanılacağını, önce/sonra teyit zincirini, ilişkili belirtileri ve yorum ipuçlarını gösterir
 - **Otomatik Çalıştırma**: Yalnızca read-only sorgular otomatik çalıştırılabilir; önceki sorgu bitmeden yenisi başlamaz
 - **Sonuçlar**: Sorgu sonuçları otomatik olarak tablo formatında gösterilir
 - **Hatalar**: Herhangi bir hata durumunda detaylı mesajlar "Hata Mesajları" bölümünde görüntülenir

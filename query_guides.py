@@ -1272,6 +1272,15 @@ def format_guide_html(name: str, guide: Optional[dict] = None, situation: Option
         parts.append(f"<p style='margin:4px 0;'><b>Sonucu nasıl okumalı:</b> {_html(guide['interpret'])}</p>")
     if guide.get("tip"):
         parts.append(f"<p style='margin:4px 0;'><b>Yönlendirme:</b> {_html(guide['tip'])}</p>")
+    related_symptoms = get_symptoms_for_query(name)
+    if related_symptoms:
+        links = " · ".join(
+            f"<a href=\"symptom:{_html(item['id'])}\">{_html(item['title'])}</a>"
+            for item in related_symptoms
+        )
+        parts.append(
+            f"<p style='margin:4px 0;'><b>İlişkili SQL belirtileri:</b> {links}</p>"
+        )
     return "".join(parts)
 
 
@@ -1288,7 +1297,9 @@ def format_situation_html(situation: dict) -> str:
         )
     return (
         f"<h3 style='margin:0 0 6px 0;'>{_html(situation.get('title', ''))}</h3>"
-        f"<p style='margin:4px 0;'><b>Belirtiler:</b> {_html(situation.get('symptoms', ''))}</p>"
+        f"<p style='margin:4px 0;'><b>Belirtiler (özet):</b> {_html(situation.get('symptoms', ''))}</p>"
+        f"<p style='margin:4px 0;color:#334155;'><b>İpucu:</b> Daha net SQL sinyali görüyorsanız "
+        "üstteki <i>SQL belirtisi</i> listesinden seçin (LCK_M_*, PAGEIOLATCH, PLE, LOG_BACKUP vb.).</p>"
         f"<p style='margin:4px 0;'><b>Hedef:</b> {_html(situation.get('goal', ''))}</p>"
         f"<p style='margin:4px 0;'><b>Önerilen sıra ({len(steps)} sorgu):</b></p>"
         f"<ol style='margin:0 0 6px 18px;'>{"".join(items)}</ol>"
@@ -1309,6 +1320,80 @@ def _html(value: str) -> str:
 
 def _query_link(name: str) -> str:
     return f'<a href="query:{_html(name)}">{_html(name)}</a>'
+
+
+
+
+SQL_SYMPTOMS: List[dict] = [{'id': 'blocked_requests', 'title': 'blocked_requests > 0 / oturumlar birbirini bekliyor', 'category': 'Kilit / Blocking', 'signals': ['Sunucu Anlık Durum Kartı: blocked_requests > 0', 'Activity Monitor: Blocked By dolu', 'Uygulama timeout / donma'], 'what_you_see': "İşlemler sıraya girer, aynı kaynakta bekleyen session'lar artar, kullanıcı timeout görür.", 'queries': ['Sunucu Anlık Durum Kartı', 'Bekleyen İşlemler (Blocking)', 'Bekleme Zincirleri (Wait Chains)', "Bloke'ye Sebep Olan Sorgular", 'Açık Transaction ile Sleeping Session', 'Aktif Lock ve Wait Detayı'], 'situation_id': 'blocking'}, {'id': 'lck_wait', 'title': 'LCK_M_* wait tipi yüksek', 'category': 'Kilit / Blocking', 'signals': ['sys.dm_os_wait_stats: LCK_M_S / LCK_M_X / LCK_M_IX', 'Aktif İşlemler.wait_type LCK_*'], 'what_you_see': "Wait statistics veya aktif request'lerde kilit wait'leri üst sıradadır.", 'queries': ['Wait Statistics (Bekleme İstatistikleri)', 'Bekleyen İşlemler (Blocking)', 'Lock Bilgileri', 'Aktif Lock ve Wait Detayı', "Bloke'ye Sebep Olan Sorgular", 'Deadlock Bilgileri (Son 24 Saat)'], 'situation_id': 'blocking'}, {'id': 'idle_open_tran', 'title': 'Sleeping session + open_transaction_count > 0', 'category': 'Kilit / Blocking', 'signals': ['dm_exec_sessions: status=sleeping ve open_transaction_count>0', 'log_reuse_wait = ACTIVE_TRANSACTION'], 'what_you_see': "Görünürde çalışan sorgu yok ama kilit/log tutuluyor; SSMS'de unutulmuş BEGIN TRAN klasik örnektir.", 'queries': ['Açık Transaction ile Sleeping Session', "Uzun Süren Transaction'lar", 'Açık Transaction ve Log Kullanımı', 'Transaction Log Durumu', 'Bekleyen İşlemler (Blocking)'], 'situation_id': 'blocking'}, {'id': 'deadlock_1205', 'title': 'Deadlock / error 1205 artışı', 'category': 'Kilit / Blocking', 'signals': ['Uygulama log: Transaction was deadlocked', 'Extended Events deadlock_graph'], 'what_you_see': 'İşlemler rastgele geri alınıyor, retry sayısı artıyor.', 'queries': ['Deadlock Bilgileri (Son 24 Saat)', 'Bekleyen İşlemler (Blocking)', 'Foreign Key Index Eksikleri', 'Index Kullanım İstatistikleri', 'Aktif Lock ve Wait Detayı'], 'situation_id': 'blocking'}, {'id': 'high_cpu', 'title': 'CPU % yüksek / runnable queue', 'category': 'CPU / Paralellik', 'signals': ['OS CPU yüksek', 'dm_os_schedulers.runnable_tasks_count > 0', 'SOS_SCHEDULER_YIELD wait'], 'what_you_see': "Sunucu CPU doygun, sorgular CPU'da sıraya giriyor.", 'queries': ['Scheduler ve Runnable Task Yoğunluğu', 'En Çok CPU Kullanan Sorgular', 'Top CPU Kullanan Planlar', 'CXPACKET / CXCONSUMER Wait Özeti', 'Yüksek Compile / Recompile Oranı', 'Parameter Sniffing Adayları'], 'situation_id': 'cpu'}, {'id': 'cxpacket', 'title': 'CXPACKET / CXCONSUMER wait yüksek', 'category': 'CPU / Paralellik', 'signals': ['Wait stats: CXPACKET veya CXCONSUMER üstte', 'MAXDOP / Cost Threshold şüphesi'], 'what_you_see': "Paralel planlar CPU'yu paylaşıyor; bazı sorgular aşırı DOP kullanıyor olabilir.", 'queries': ['CXPACKET / CXCONSUMER Wait Özeti', 'Paralel Çalışan Sorgular', 'En Çok CPU Kullanan Sorgular', 'Varsayılan Olmayan Sunucu Ayarları', 'Scheduler ve Runnable Task Yoğunluğu'], 'situation_id': 'cpu'}, {'id': 'compile_storm', 'title': 'SQL Compilations/sec yüksek', 'category': 'CPU / Paralellik', 'signals': ['SQL Statistics: Compilations/sec ≈ Batch Requests/sec', 'Ad-hoc single-use plan oranı yüksek'], 'what_you_see': 'CPU plan üretmeye gidiyor; ad-hoc SQL veya sık recompile.', 'queries': ['Yüksek Compile / Recompile Oranı', 'Ad-hoc Plan Cache Şişmesi', 'Tek Kullanımlık Pahalı Planlar', 'Plan Cache İstatistikleri', 'Varsayılan Olmayan Sunucu Ayarları'], 'situation_id': 'cpu'}, {'id': 'pageiolatch', 'title': 'PAGEIOLATCH_* wait yüksek', 'category': 'Disk / I/O', 'signals': ['Wait stats: PAGEIOLATCH_SH/EX', 'Yüksek physical reads', 'PLE düşük eşlik edebilir'], 'what_you_see': 'Sorgular sayfa okumak için diski bekliyor.', 'queries': ['Wait Statistics (Bekleme İstatistikleri)', 'Read/Write Latency Analizi', 'Pending Disk I/O İstekleri', 'En Çok Physical Read Yapan Sorgular', 'Page Life Expectancy ve Buffer Hit', 'En Çok Logical Read Yapan Sorgular'], 'situation_id': 'io'}, {'id': 'writelog', 'title': 'WRITELOG wait / log yazma gecikmesi', 'category': 'Disk / I/O', 'signals': ['Wait stats: WRITELOG', 'Log dosyası latency yüksek'], 'what_you_see': "Commit'ler log I/O'da bekler; OLTP yavaşlar.", 'queries': ['Read/Write Latency Analizi', 'Transaction Log Durumu', 'Veritabanı Dosya Bilgileri', 'Pending Disk I/O İstekleri', 'Log Backup Geçmişi'], 'situation_id': 'io'}, {'id': 'high_latency', 'title': 'Dosya avg read/write latency yüksek', 'category': 'Disk / I/O', 'signals': ['dm_io_virtual_file_stats: avg latency > ~20ms (data), log daha hassas', 'Storage alert'], 'what_you_see': 'Belirli DB/dosya yavaş; autogrowth veya hotspot olabilir.', 'queries': ['Read/Write Latency Analizi', 'Pending Disk I/O İstekleri', 'Autogrowth Olayları (Default Trace)', 'TempDB Dosya Dengesizliği', 'Disk I/O İstatistikleri'], 'situation_id': 'io'}, {'id': 'low_ple', 'title': 'Page Life Expectancy düşük', 'category': 'Bellek', 'signals': ['Buffer Manager: Page life expectancy düşük/düşüyor', 'Buffer cache hit ratio düşüşü'], 'what_you_see': 'Cache sayfaları erken düşüyor; physical read artar.', 'queries': ['Page Life Expectancy ve Buffer Hit', 'Memory Grant Bekleyen Sorgular', 'En Çok Bellek Kullanan Sorgular', 'Sistem Bellek Detayları', 'En Çok Physical Read Yapan Sorgular', 'Ad-hoc Plan Cache Şişmesi'], 'situation_id': 'memory'}, {'id': 'resource_semaphore', 'title': 'RESOURCE_SEMAPHORE / memory grant pending', 'category': 'Bellek', 'signals': ['wait_type RESOURCE_SEMAPHORE', 'Memory Grants Pending > 0'], 'what_you_see': 'Sorgular bellek grant kuyruğunda; sort/hash için yer bekliyor.', 'queries': ['Memory Grant Bekleyen Sorgular', 'Page Life Expectancy ve Buffer Hit', 'En Çok Bellek Kullanan Sorgular', 'Aktif İşlemler', 'Yavaş Çalışan Sorgular'], 'situation_id': 'memory'}, {'id': 'plan_regression', 'title': 'Dün hızlı, bugün yavaş (plan regresyonu)', 'category': 'Sorgu / Plan', 'signals': ['Aynı SP/parametre seti süre sıçraması', 'Query Store plan değişimi'], 'what_you_see': 'Belirli sorgu aniden yavaşlar; genel sunucu sağlıklı olabilir.', 'queries': ['Query Store Durum Özeti', 'Query Store Plan Regresyonları', 'Query Store En Yavaş Sorgular', 'Parameter Sniffing Adayları', 'Statistics Güncellik Durumu', 'Eksik Indexler (Öneriler)'], 'situation_id': 'slow_query'}, {'id': 'param_sniffing', 'title': 'Aynı sorgu bazen çok yavaş (parameter sniffing)', 'category': 'Sorgu / Plan', 'signals': ['Aynı query_hash için yüksek süre/CPU varyansı', 'Farklı parametrelerle kararsız plan'], 'what_you_see': 'SP bazen 100ms bazen 30sn; parametreye duyarlı.', 'queries': ['Parameter Sniffing Adayları', 'Query Store Plan Regresyonları', 'Statistics Güncellik Durumu', 'Yavaş Çalışan Sorgular', 'Top CPU Kullanan Planlar'], 'situation_id': 'slow_query'}, {'id': 'high_logical_reads', 'title': 'Logical read çok yüksek / ağır scan', 'category': 'Sorgu / Plan', 'signals': ['dm_exec_query_stats: total_logical_reads liderleri', 'Eksik index önerileri'], 'what_you_see': 'CPU veya I/O yükseliyor; sorgular çok sayfa okuyor.', 'queries': ['En Çok Logical Read Yapan Sorgular', 'Eksik Indexler (Öneriler)', 'Yavaş Çalışan Sorgular', 'Index Kullanım İstatistikleri', 'Foreign Key Index Eksikleri'], 'situation_id': 'slow_query'}, {'id': 'tempdb_full', 'title': 'TempDB doluyor / alan uyarısı', 'category': 'TempDB', 'signals': ['TempDB disk doluluk', 'Hata: 1101/1105 tempdb'], 'what_you_see': "Geçici nesne, version store veya spill TempDB'yi şişiriyor.", 'queries': ['TempDB Kullanımı', 'Açık Transaction ve Log Kullanımı', 'Aktif İşlemler', 'TempDB Dosya Dengesizliği', "Uzun Süren Transaction'lar"], 'situation_id': 'tempdb'}, {'id': 'tempdb_pagelatch', 'title': 'TempDB PAGELATCH contention', 'category': 'TempDB', 'signals': ['PAGELATCH_UP/EX on TempDB', 'Allocation bottleneck'], 'what_you_see': 'Çok sayıda eşzamanlı temp table/#table yaratımı yavaşlıyor.', 'queries': ['Tempdb Contention Analizi', 'TempDB Dosya Dengesizliği', 'Latch Contention Top', 'TempDB Kullanımı', 'Aktif İşlemler'], 'situation_id': 'tempdb'}, {'id': 'log_reuse_active_tran', 'title': 'log_reuse_wait = ACTIVE_TRANSACTION', 'category': 'Log / Yedek', 'signals': ['Transaction Log Durumu: ACTIVE_TRANSACTION', 'Log dosyası büyümeye devam'], 'what_you_see': 'Log truncate olamıyor çünkü açık transaction var.', 'queries': ['Transaction Log Durumu', "Uzun Süren Transaction'lar", 'Açık Transaction ile Sleeping Session', 'Açık Transaction ve Log Kullanımı', 'Bekleyen İşlemler (Blocking)'], 'situation_id': 'log_rpo'}, {'id': 'log_reuse_log_backup', 'title': 'log_reuse_wait = LOG_BACKUP', 'category': 'Log / Yedek', 'signals': ['FULL/BULK_LOGGED + log backup gecikmiş/yok', 'RPO Riski: Log backup yok/gecikmeli'], 'what_you_see': 'Log şişer; point-in-time restore riski artar.', 'queries': ['RPO Riski - Backup Gecikmeleri', 'Log Backup Geçmişi', 'Transaction Log Durumu', 'SQL Agent Job Durumları', 'VLF (Virtual Log File) Sayısı'], 'situation_id': 'log_rpo'}, {'id': 'too_many_vlfs', 'title': 'Aşırı VLF sayısı', 'category': 'Log / Yedek', 'signals': ['sys.dm_db_log_info: yüzlerce/binlerce VLF', 'Yavaş recovery / uzun crash recovery'], 'what_you_see': 'Log operasyonları ve recovery uzar; sık küçük autogrowth geçmişi tipiktir.', 'queries': ['VLF (Virtual Log File) Sayısı', 'Autogrowth Olayları (Default Trace)', 'Transaction Log Durumu', 'Veritabanı Dosya Büyüme Durumu', 'Dosya Alanı ve Büyüme Riski'], 'situation_id': 'log_rpo'}, {'id': 'backup_overdue', 'title': 'Full/log backup gecikmiş veya yok', 'category': 'Log / Yedek', 'signals': ['RPO Riski sınıfları', 'msdb backupset boş/eski'], 'what_you_see': 'Yedek SLA bozulmuş; disaster recovery güvencesi zayıf.', 'queries': ['RPO Riski - Backup Gecikmeleri', 'Veritabanı Backup Durumu', 'Full Backup Geçmişi', 'Log Backup Geçmişi', 'Differential Backup Geçmişi', "Başarısız Job'lar"], 'situation_id': 'log_rpo'}, {'id': 'unused_indexes', 'title': 'Yazma yavaş / gereksiz index şüphesi', 'category': 'Index / Schema', 'signals': ['INSERT/UPDATE yavaş', 'Çok sayıda az kullanılan index'], 'what_you_see': 'OLTP yazma maliyeti yüksek; index bakımı uzun sürüyor.', 'queries': ['Kullanılmayan Indexler', 'Yinelenen / Çakışan Indexler', 'Index Kullanım İstatistikleri', 'Fragmente Indexler', 'Foreign Key Index Eksikleri'], 'situation_id': 'index'}, {'id': 'forwarded_records', 'title': 'Heap + forwarded record', 'category': 'Index / Schema', 'signals': ['dm_db_index_physical_stats: forwarded_record_count > 0', 'Heap tabloda ağır update/okuma'], 'what_you_see': 'Heap tablolarda ekstra I/O; scan maliyeti artar.', 'queries': ['Heap Tablolar ve Forwarded Record', 'Primary Key Olmayan Tablolar', 'En Çok Logical Read Yapan Sorgular', 'Fragmente Indexler'], 'situation_id': 'index'}, {'id': 'sysadmin_excess', 'title': 'sysadmin / excess privilege', 'category': 'Güvenlik', 'signals': ['Uygulama hesabı sysadmin', 'Audit bulgusu'], 'what_you_see': 'Least privilege ihlali; risk yüzeyi geniş.', 'queries': ['Sysadmin ve Yüksek Yetkili Loginler', 'Server Level İzinler', 'Database Level İzinler', 'Zayıf Login Politikaları', 'Linked Server Envanteri'], 'situation_id': 'security'}, {'id': 'login_failed', 'title': 'Login failed / authentication hataları', 'category': 'Güvenlik', 'signals': ['Error 18456', 'Uygulama bağlanamıyor', 'Ring buffer exception tekrarları'], 'what_you_see': 'Başarısız oturum açma artışı; orphan user veya parola/policy sorunu olabilir.', 'queries': ['Başarısız Login Ring Buffer', 'SQL Server Hataları (Son 24 Saat)', 'Orphaned Database Users', 'Zayıf Login Politikaları', 'Ring Buffer Connectivity Hataları'], 'situation_id': 'security'}, {'id': 'ag_lag', 'title': 'AG redo/log send queue büyüyor', 'category': 'HA / Always On', 'signals': ['dm_hadr_database_replica_states: redo_queue_size / log_send_queue_size yüksek', 'Secondary geride'], 'what_you_see': 'Rapor/DR secondary gecikmeli; failover RPO/RTO riski.', 'queries': ['Availability Groups Durumu', 'AG Senkronizasyon Gecikmesi', 'Availability Replicas', 'Disk I/O İstatistikleri', 'AG Listener ve Endpoint Durumu'], 'situation_id': 'ag'}, {'id': 'ag_listener', 'title': 'AG listener / endpoint bağlantı sorunu', 'category': 'HA / Always On', 'signals': ["Uygulama listener'a bağlanamıyor", 'Endpoint state sorunlu'], 'what_you_see': "Bağlantı string listener DNS/port'ta takılır.", 'queries': ['AG Listener ve Endpoint Durumu', 'Availability Groups Durumu', 'Availability Replicas', 'Sertifika ve Key Son Kullanım Tarihleri', 'Ring Buffer Connectivity Hataları'], 'situation_id': 'ag'}, {'id': 'job_failed', 'title': 'SQL Agent job fail / çalışmıyor', 'category': 'Agent / Operasyon', 'signals': ['Job history run_status = 0', 'Enabled job 7+ gündür çalışmamış', 'Backup/ETL job kırmızı'], 'what_you_see': 'Gece işleri kırık; mail gelmiyor olabilir.', 'queries': ["Başarısız Job'lar", 'Job Başarı Oranı (Son 7 Gün)', 'SQL Agent Job Durumları', "Uzun Süredir Çalışmayan Job'lar", "Çalışan Job'lar", 'Database Mail Queue'], 'situation_id': 'agent'}, {'id': 'exception_spike', 'title': 'Exception / severity yüksek hata artışı', 'category': 'Hata / Connectivity', 'signals': ['Ring buffer exception yoğunluğu', 'Uygulama hata log spike'], 'what_you_see': 'Ani hata frekansı; connectivity veya corruption sinyali eşlik edebilir.', 'queries': ['SQL Server Hataları (Son 24 Saat)', 'Ring Buffer Exception Özeti', 'Ring Buffer Connectivity Hataları', 'Suspect Pages (Bozuk Sayfa)', 'Veritabanı Durumları'], 'situation_id': 'errors'}, {'id': 'suspect_pages', 'title': '823/824 / suspect_pages kaydı', 'category': 'Hata / Connectivity', 'signals': ['msdb.dbo.suspect_pages dolu', 'I/O error 823/824'], 'what_you_see': 'Olası sayfa bozulması; storage/DBCC hattına geçilmeli (bu araç DBCC çalıştırmaz).', 'queries': ['Suspect Pages (Bozuk Sayfa)', 'Veritabanı Durumları', 'Ring Buffer Exception Özeti', 'Read/Write Latency Analizi', 'Veritabanı Backup Durumu'], 'situation_id': 'errors'}, {'id': 'autogrowth_storm', 'title': 'Sık autogrowth / ani latency spike', 'category': 'Kapasite', 'signals': ['Default trace: Data/Log File Auto Grow', 'Latency spike growth zamanıyla çakışıyor'], 'what_you_see': 'Dosya büyürken kısa süreli donmalar.', 'queries': ['Autogrowth Olayları (Default Trace)', 'Dosya Alanı ve Büyüme Riski', 'Veritabanı Dosya Büyüme Durumu', 'Read/Write Latency Analizi', 'Veritabanı Boyutları'], 'situation_id': 'capacity'}, {'id': 'disk_full', 'title': 'Disk doluyor / hangi DB şişiyor belirsiz', 'category': 'Kapasite', 'signals': ['OS disk uyarısı', 'DB boyut sıçraması'], 'what_you_see': 'Kapasite alarmı; data mı log mı, hangi tablo şişiyor bilinmiyor.', 'queries': ['Veritabanı Boyutları', 'Dosya Alanı ve Büyüme Riski', 'Tablo Boyutları ve Satır Sayıları', 'Veritabanı Dosya Bilgileri', 'Transaction Log Durumu', 'Identity Kapasiteye Yaklaşan Kolonlar'], 'situation_id': 'capacity'}, {'id': 'connection_leak', 'title': 'Bağlantı sızıntısı / pool şişmesi', 'category': 'Bağlantı', 'signals': ['Sleeping session sayısı anormal yüksek', 'Uygulama pool exhaustion'], 'what_you_see': 'Session count artar, çoğu sleeping; uygulama bağlantıyı bırakmıyor olabilir.', 'queries': ['Uygulama Bazlı Bağlantı Dağılımı', 'Idle Session ve Sleeping Connections', 'Connection Pool İstatistikleri', 'Uzun Süreli Bağlantılar', 'Aktif Bağlantılar', 'Açık Transaction ile Sleeping Session'], 'situation_id': 'triage'}, {'id': 'unknown_slowness', 'title': 'Genel yavaşlık — sınıf belirsiz', 'category': 'Triage', 'signals': ['Kullanıcı şikayeti', 'Net wait/CPU/IO ayrımı yok'], 'what_you_see': 'Her şey biraz yavaş; önce sınıflandırma gerekir.', 'queries': ['Sunucu Anlık Durum Kartı', 'Wait Statistics (Bekleme İstatistikleri)', 'Aktif İşlemler', 'Scheduler ve Runnable Task Yoğunluğu', 'Page Life Expectancy ve Buffer Hit', 'Yavaş Çalışan Sorgular'], 'situation_id': 'triage'}]
+
+
+def get_sql_symptoms() -> List[dict]:
+    return list(SQL_SYMPTOMS)
+
+
+def get_symptom_by_id(symptom_id: str) -> Optional[dict]:
+    for item in SQL_SYMPTOMS:
+        if item.get("id") == symptom_id:
+            return item
+    return None
+
+
+def get_symptoms_for_query(query_name: str) -> List[dict]:
+    """Bir sorgunun ilişkili SQL belirtilerini döndür."""
+    related = []
+    for item in SQL_SYMPTOMS:
+        if query_name in (item.get("queries") or []):
+            related.append(item)
+    return related
+
+
+def format_symptom_html(symptom: dict) -> str:
+    """Belirti seçildiğinde gösterilecek HTML."""
+    signals = symptom.get("signals") or []
+    signal_items = "".join(f"<li>{_html(x)}</li>" for x in signals)
+    steps = symptom.get("queries") or []
+    step_items = []
+    for idx, q in enumerate(steps, 1):
+        step_items.append(
+            f"<li style='margin-bottom:4px;'><b>Script {idx}:</b> {_query_link(q)}</li>"
+        )
+    situation = get_situation_by_id(symptom.get("situation_id") or "")
+    situation_line = ""
+    if situation:
+        situation_line = (
+            "<p style='margin:4px 0;'><b>İlgili durum playbook:</b> "
+            f"{_html(situation.get('title', ''))}</p>"
+        )
+    return (
+        f"<h3 style='margin:0 0 6px 0;'>Belirti: {_html(symptom.get('title', ''))}</h3>"
+        f"<p style='margin:4px 0;'><b>Kategori:</b> {_html(symptom.get('category', ''))}</p>"
+        f"<p style='margin:4px 0;'><b>SQL sunucuda ne görürsünüz:</b> {_html(symptom.get('what_you_see', ''))}</p>"
+        f"<p style='margin:4px 0;'><b>Teknik sinyaller:</b></p>"
+        f"<ul style='margin:0 0 6px 18px;'>{signal_items}</ul>"
+        f"{situation_line}"
+        f"<p style='margin:4px 0;'><b>Bu belirti için çalıştırılacak scriptler ({len(steps)}):</b></p>"
+        f"<ol style='margin:0 0 6px 18px;'>{''.join(step_items)}</ol>"
+        "<p style='margin:4px 0;color:#475569;'>Script adına tıklayarak yükleyin. "
+        "Her scriptin kendi önce/sonra teyit zinciri de rehberde görünür.</p>"
+    )
+
+
+def search_symptoms(term: str) -> List[dict]:
+    term_lower = (term or "").strip().lower()
+    results = []
+    for item in SQL_SYMPTOMS:
+        blob = " ".join(
+            [
+                item.get("title", ""),
+                item.get("category", ""),
+                item.get("what_you_see", ""),
+                " ".join(item.get("signals") or []),
+                " ".join(item.get("queries") or []),
+            ]
+        ).lower()
+        if not term_lower or term_lower in blob:
+            results.append(item)
+    return results
 
 
 def search_guides(term: str) -> List[str]:

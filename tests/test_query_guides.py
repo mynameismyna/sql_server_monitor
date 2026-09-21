@@ -56,6 +56,34 @@ class QueryGuideTests(unittest.TestCase):
         matches = search_predefined_queries("timeout")
         self.assertIn("Bekleyen İşlemler (Blocking)", matches)
 
+    def test_sql_symptoms_catalog(self):
+        from query_guides import SQL_SYMPTOMS, format_symptom_html, get_sql_symptoms
+
+        symptoms = get_sql_symptoms()
+        self.assertGreaterEqual(len(symptoms), 30)
+        self.assertEqual(len(symptoms), len(SQL_SYMPTOMS))
+        for symptom in symptoms:
+            with self.subTest(symptom=symptom["id"]):
+                self.assertTrue(symptom["title"])
+                self.assertTrue(symptom["what_you_see"])
+                self.assertTrue(symptom["signals"])
+                self.assertTrue(symptom["queries"])
+                for query_name in symptom["queries"]:
+                    self.assertIn(query_name, QUERY_GUIDES)
+                html = format_symptom_html(symptom)
+                self.assertIn("Teknik sinyaller", html)
+                self.assertIn("Script 1", html)
+
+    def test_search_by_wait_type_finds_symptom_queries(self):
+        matches = search_predefined_queries("PAGEIOLATCH")
+        self.assertIn("Read/Write Latency Analizi", matches)
+        self.assertIn("Pending Disk I/O İstekleri", matches)
+
+    def test_guide_lists_related_symptoms(self):
+        html = format_guide_html("Bekleyen İşlemler (Blocking)")
+        self.assertIn("İlişkili SQL belirtileri", html)
+        self.assertIn("symptom:", html)
+
 
 if __name__ == "__main__":
     unittest.main()
