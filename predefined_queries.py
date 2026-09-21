@@ -5,6 +5,15 @@ import json
 import os
 
 from advanced_queries import ADVANCED_QUERIES, QUERY_DESCRIPTIONS
+from query_guides import (
+    QUERY_GUIDES,
+    format_guide_html,
+    format_situation_html,
+    get_query_guide,
+    get_situation_by_id,
+    get_situation_playbooks,
+    search_guides,
+)
 
 USER_QUERIES_FILE = "user_queries.json"
 
@@ -1433,7 +1442,7 @@ PREDEFINED_QUERIES = {
 # Gelişmiş diagnostik kataloğunu ekle (kategori sırası korunur)
 PREDEFINED_QUERIES.update(ADVANCED_QUERIES)
 
-# Temel sorgular için de kısa açıklamalar
+# Temel sorgular için kısa açıklamalar (geriye dönük uyumluluk)
 QUERY_DESCRIPTIONS.update({
     "Aktif Bağlantılar": "Kullanıcı oturumlarını CPU ve I/O ile listeler.",
     "Yavaş Çalışan Sorgular": "Plan cache'den toplam elapsed time'a göre en yavaş sorguları getirir.",
@@ -1444,22 +1453,35 @@ QUERY_DESCRIPTIONS.update({
     "TempDB Kullanımı": "TempDB alan ve oturum kullanımını özetler.",
 })
 
+# Rehber özetlerini kısa açıklama olarak da yayınla
+for _name, _guide in QUERY_GUIDES.items():
+    summary = (_guide.get("summary") or "").strip()
+    if summary and _name not in QUERY_DESCRIPTIONS:
+        QUERY_DESCRIPTIONS[_name] = summary
+
 
 def get_query_description(name: str) -> str:
     """Seçili sorgu için kısa açıklama döndür."""
-    return QUERY_DESCRIPTIONS.get(name, "")
+    if name in QUERY_DESCRIPTIONS:
+        return QUERY_DESCRIPTIONS[name]
+    guide = get_query_guide(name)
+    return guide.get("summary", "")
 
 
 def search_predefined_queries(term: str):
-    """Ada veya açıklamaya göre hazır sorgu ara."""
+    """Ada, açıklamaya veya rehber metnine göre hazır sorgu ara."""
     term_lower = (term or "").strip().lower()
-    results = []
-    for name, query in PREDEFINED_QUERIES.items():
+    if not term_lower:
+        return sorted(name for name in PREDEFINED_QUERIES if not name.startswith("==="))
+
+    guided = set(search_guides(term_lower))
+    results = set()
+    for name in PREDEFINED_QUERIES:
         if name.startswith("==="):
             continue
         description = QUERY_DESCRIPTIONS.get(name, "")
-        if not term_lower or term_lower in name.lower() or term_lower in description.lower():
-            results.append(name)
+        if term_lower in name.lower() or term_lower in description.lower() or name in guided:
+            results.add(name)
     return sorted(results)
 
 

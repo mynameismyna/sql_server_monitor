@@ -15,7 +15,9 @@ SQL Server üzerinde analiz yapmak, hataları takip etmek ve read-only sorgular 
   - SQL Agent operasyon, Always On gecikme, TempDB dengesi, açık transaction
   - Yapılandırma, Query Store, CDC/Change Tracking, Service Broker, In-Memory OLTP
   - Ring buffer exception / connectivity / scheduler monitor
-- **Sorgu Arama**: Ada ve açıklamaya göre hızlı filtreleme
+- **Sorgu Arama**: Ada, belirtiye ve rehber metnine göre hızlı filtreleme
+- **Sorgu Rehberi**: Her sorgu için ne zaman kullanılacağı, fayda ettiği durumlar, önce/sonra teyit sorguları ve sonuç yorumlama ipuçları
+- **Durum Playbook'ları**: Blocking, CPU, I/O, bellek, TempDB, RPO, güvenlik gibi yaşanan duruma göre önerilen sorgu sırası
 - **Sorgu Sonuçları**: Sonuçları tablo formatında görüntüleme ve Excel’e aktarma
 - **Hata Yönetimi**: Detaylı hata mesajlarını görüntüleme
 - **Sonuç Sınırı**: Büyük sonuç kümelerini ilk 10.000 satırla sınırlandırma
@@ -69,7 +71,9 @@ Uygulama açıldığında:
 ## Kullanım İpuçları
 
 - **F5 Tuşu**: Sorguyu hızlıca çalıştırmak için F5 tuşunu kullanabilirsiniz
-- **Kategori + Arama**: Önce kategori seçin veya `blocking`, `backup`, `index` gibi anahtar kelimelerle arayın
+- **Kategori + Arama**: Önce kategori seçin veya `blocking`, `backup`, `PLE` gibi anahtar kelimelerle arayın
+- **Yaşadığım durum**: Belirtiye göre playbook seçin; önerilen sıradaki sorgulara tıklayarak ilerleyin
+- **Rehber paneli**: Seçili sorgunun ne zaman kullanılacağını, önce/sonra teyit zincirini ve yorum ipuçlarını gösterir
 - **Otomatik Çalıştırma**: Yalnızca read-only sorgular otomatik çalıştırılabilir; önceki sorgu bitmeden yenisi başlamaz
 - **Sonuçlar**: Sorgu sonuçları otomatik olarak tablo formatında gösterilir
 - **Hatalar**: Herhangi bir hata durumunda detaylı mesajlar "Hata Mesajları" bölümünde görüntülenir
@@ -79,6 +83,7 @@ Uygulama açıldığında:
 - **Framework**: PyQt5 (Python GUI framework)
 - **Veritabanı Bağlantısı**: pyodbc (ODBC driver kullanarak)
 - **Sorgu Kataloğu**: `predefined_queries.py` + `advanced_queries.py`
+- **Sorgu Rehberi / Playbook**: `query_guides.py`
 - **Güvenlik Katmanı**: `query_safety.py` (yalnızca SELECT/CTE)
 
 - **Veri İşleme**: pandas (sonuçları işlemek için)
